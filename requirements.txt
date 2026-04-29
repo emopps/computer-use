@@ -1,0 +1,45 @@
+# open-computer-use 完整依赖清单
+#
+# 说明：
+# 1. 这是单文件、全量 requirements，包含：
+#    - 核心运行依赖
+#    - Qt5 GUI 依赖
+#    - 本地视觉模型可选依赖
+#    - 下载模型脚本依赖
+#    - 测试依赖
+# 2. 其中部分包只在特定能力下使用：
+#    - torch / transformers / accelerate：Hugging Face 本地视觉后端
+#    - llama-cpp-python：llama.cpp 本地视觉后端
+#    - huggingface_hub：模型下载脚本
+#    - pytest：测试
+# 3. Linux 无障碍能力除 Python 包外，通常还需要系统侧的 AT-SPI 组件。
+
+# 核心运行
+python-dotenv>=1.0.1,<2.0.0
+Pillow>=11.0.0,<12.0.0
+requests>=2.31.0,<3.0.0
+pyautogui>=0.9.54,<1.0.0
+mss>=9.0.2,<10.0.0
+python-xlib>=0.33,<1.0.0
+PyPDF2>=3.0.1,<4.0.0
+
+# GUI
+PyQt5>=5.15.11,<6.0.0
+
+# Linux AT-SPI
+pyatspi; platform_system == "Linux"
+
+# 本地视觉后端：Hugging Face
+numpy>=1.24
+torch>=2.1
+transformers>=4.45
+accelerate>=0.33
+
+# 本地视觉后端：llama.cpp
+llama-cpp-python>=0.2.90
+
+# 模型下载脚本
+huggingface_hub>=0.24
+
+# 测试
+pytest>=7.4,<9.0

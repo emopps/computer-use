@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "risk-copy",
+      "name": "File copy should be tracked",
+      "match": {
+        "operation_kinds": ["filesystem.copy"],
+        "task_keywords": ["复制", "copy"]
+      },
+      "decision": "track_only",
+      "outcome": "track_only",
+      "risk_level": "low",
+      "reason": "Copying files is common but should remain auditable."
+    },
+    {
+      "id": "risk-move",
+      "name": "File move is risky",
+      "match": {
+        "operation_kinds": ["filesystem.move"],
+        "task_keywords": ["移动", "move", "归档", "archive"]
+      },
+      "decision": "require_audit",
+      "outcome": "confirm",
+      "risk_level": "high",
+      "reason": "Moving files can change user data locations."
+    },
+    {
+      "id": "risk-rename",
+      "name": "File rename is risky",
+      "match": {
+        "operation_kinds": ["filesystem.rename"],
+        "task_keywords": ["重命名", "rename"]
+      },
+      "decision": "require_audit",
+      "outcome": "confirm",
+      "risk_level": "medium",
+      "reason": "Renaming files can affect downstream references."
+    },
+    {
+      "id": "risk-delete",
+      "name": "File delete is high risk",
+      "match": {
+        "operation_kinds": ["filesystem.delete"],
+        "task_keywords": ["删除", "delete", "移除", "清空"]
+      },
+      "decision": "require_audit",
+      "outcome": "confirm",
+      "risk_level": "high",
+      "reason": "Deleting files can permanently destroy user data."
+    },
+    {
+      "id": "track-create-folder",
+      "name": "Folder creation should be tracked",
+      "match": {
+        "operation_kinds": ["filesystem.create_folder"],
+        "task_keywords": ["新建文件夹", "创建文件夹", "folder"]
+      },
+      "decision": "track_only",
+      "outcome": "track_only",
+      "risk_level": "low",
+      "reason": "Creating folders is low risk but should remain auditable."
+    },
+    {
+      "id": "risk-write-text",
+      "name": "Desktop file creation should be tracked",
+      "match": {
+        "operation_kinds": ["filesystem.write_text"],
+        "task_keywords": ["txt", "文本", "记事本", "text file"]
+      },
+      "decision": "track_only",
+      "outcome": "track_only",
+      "risk_level": "low",
+      "reason": "Creating text files is low risk but should remain auditable."
+    },
+    {
+      "id": "default-browser-search",
+      "name": "Browser search is standard execution",
+      "match": {
+        "operation_kinds": ["browser.open", "browser.search"],
+        "task_keywords": ["浏览器", "搜索", "browser", "search", "天气", "weather"]
+      },
+      "decision": "standard_execute",
+      "outcome": "register",
+      "risk_level": "low",
+      "reason": "Opening a browser and searching is a standard task flow."
+    },
+    {
+      "id": "external-send-review",
+      "name": "Sending or external delivery requires confirmation",
+      "match": {
+        "operation_kinds": ["browser.send"],
+        "task_keywords": ["发送", "外发", "邮件", "email", "send", "附件"]
+      },
+      "decision": "require_audit",
+      "outcome": "confirm",
+      "risk_level": "high",
+      "reason": "External delivery actions require explicit confirmation."
+    }
+  ]
+}

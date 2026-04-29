@@ -1,0 +1,59 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native / coverage / test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local configuration
+.env
+.env.*
+
+# Runtime outputs
+output/
+memory/
+screenshots/
+logs/
+tmp/
+temp/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# OS / desktop noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated binary / database artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Test artifacts
+tests/__pycache__/
+tests/*.png
+scripts/__pycache__/
