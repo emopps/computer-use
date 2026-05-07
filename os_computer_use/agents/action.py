@@ -98,6 +98,7 @@ class ActionAgent:
             self._validate_execution(kind, before_hash, output, args)
             return output
         if kind == "filesystem.write_text":
+            self._ensure_no_unresolved_reference_payload(args)
             file_path = self._resolve_text_file_path(args)
             text = self._resolve_text_from_args_or_operation(args, context)
             self.desktop.write_text_file(file_path, str(text))
@@ -177,6 +178,7 @@ class ActionAgent:
             )
         if kind == "spreadsheet.write_cell":
             # 统一解析 text / from_operation，避免把引用对象或 JSON 字符串原样写入单元格
+            self._ensure_no_unresolved_reference_payload(args)
             args["text"] = self._resolve_text_from_args_or_operation(args, context)
             file_path = self._resolve_spreadsheet_path(args, require_exists=False) if (args.get("file_path") or args.get("file_name")) else ""
             return await self._execute_ui_operation(
@@ -259,8 +261,10 @@ class ActionAgent:
                 # 直接执行（xdotool/Playwright API 调用）
                 output = await primary_executor()
                 self._validate_execution(kind, before_hash, output, args)
+                self._failure_counts[kind] = 0
                 return output
             except Exception as exc:
+                self._failure_counts[kind] = self._failure_counts.get(kind, 0) + 1
                 failures.append(
                     "{} attempt failed: {} ({})".format(
                         mode,
@@ -283,6 +287,7 @@ class ActionAgent:
                     failure_message=" | ".join(failures) if failures else "non-visual strategies exhausted",
                 )
                 self._validate_execution(kind, before_hash, output, args)
+                self._failure_counts[kind] = 0
                 return output
 
         raise TaskExecutionError(
@@ -398,7 +403,55 @@ class ActionAgent:
             raise TaskExecutionError(
                 "Failed to write to spreadsheet cell {} with current desktop state.".format(cell)
             )
-        return {"file_path": file_path, "cell": cell, "text": text}
+        if file_path:
+            expected_text = str(text).strip()
+            expected_lines = [line.strip() for line in expected_text.splitlines() if line.strip()]
+            verification = {"mode": "single_cell", "saved_text": ""}
+
+            if expected_lines and len(expected_lines) > 1:
+                saved_lines: List[str] = []
+                for _ in range(5):
+                    saved_lines = [
+                        str(item).strip()
+                        for item in self.desktop.read_spreadsheet_vertical_range(file_path, cell, len(expected_lines))
+                    ]
+                    if saved_lines == expected_lines:
+                        break
+                    await asyncio.sleep(0.6)
+                verification = {"mode": "vertical_range", "saved_lines": saved_lines}
+                if saved_lines != expected_lines:
+                    raise TaskExecutionError(
+                        "Spreadsheet range starting at {} mismatch after save. Expected '{}', got '{}'.".format(
+                            cell,
+                            " | ".join(expected_lines)[:120],
+                            " | ".join(saved_lines)[:120],
+                        )
+                    )
+            elif expected_text:
+                saved_text = ""
+                for _ in range(5):
+                    saved_text = self.desktop.read_spreadsheet_cell(file_path, cell)
+                    if str(saved_text).strip() == expected_text:
+                        break
+                    await asyncio.sleep(0.6)
+                verification = {"mode": "single_cell", "saved_text": saved_text}
+                if str(saved_text).strip() != expected_text:
+                    raise TaskExecutionError(
+                        "Spreadsheet cell {} content mismatch after save. Expected '{}', got '{}'.".format(
+                            cell,
+                            expected_text[:80],
+                            str(saved_text).strip()[:80],
+                        )
+                    )
+        else:
+            expected_lines = [line.strip() for line in str(text).strip().splitlines() if line.strip()]
+            verification = {
+                "mode": "vertical_range" if len(expected_lines) > 1 else "single_cell",
+            }
+        result = {"file_path": file_path, "cell": cell, "text": text, "verification": verification}
+        if len(expected_lines) > 1:
+            result["written_lines"] = expected_lines
+        return result
 
     def _ensure_browser_ui_lock(self):
         if self._browser_ui_lock is None:
@@ -480,6 +533,12 @@ class ActionAgent:
                 useful = bool(distilled.get("useful", candidate))
                 reason = str(distilled.get("reason", "") or "").strip()
 
+        if ("天气" in str(query or "")) and filtered_text:
+            if self._looks_like_weather_answer(filtered_text, query):
+                useful = True
+                if reason == "":  # 保留更强的失败原因，否则直接兜正
+                    reason = "weather_homepage_answer"
+
         return {
             "query": query,
             "text": filtered_text,
@@ -487,6 +546,21 @@ class ActionAgent:
             "useful": useful,
             "reason": reason,
         }
+
+    @staticmethod
+    def _looks_like_weather_answer(text: str, query: str = "") -> bool:
+        payload = str(text or "").strip()
+        if not payload:
+            return False
+        if query:
+            city = str(query).replace("天气", "").strip()
+            if city and city not in payload:
+                return False
+        weather_tokens = ["晴", "多云", "阴", "小雨", "中雨", "大雨", "暴雨", "雷阵雨", "阵雨", "雾", "霾"]
+        has_weather = any(token in payload for token in weather_tokens)
+        has_temp = bool(re.search(r"\d{1,2}(?:\s*[~～\-至]\s*\d{1,2})?\s*℃", payload))
+        has_detail = any(token in payload for token in ["风", "级", "空气质量", "湿度"])
+        return has_weather and (has_temp or has_detail)
 
     def _distill_browser_search_result(self, query: str, raw_text: str) -> Dict[str, Any]:
         prompt = (
@@ -620,6 +694,9 @@ class ActionAgent:
             source_result = context.results.get(source_op_id)
             if source_result and source_result.status == OperationStatus.COMPLETED:
                 output = source_result.output
+                selected_line = self._select_line_for_spreadsheet_target(args, output)
+                if selected_line:
+                    return selected_line
                 # output 可能是字符串或字典
                 if isinstance(output, str):
                     return output
@@ -627,9 +704,59 @@ class ActionAgent:
                     # 优先取 text 字段，否则取整个 output 的字符串
                     return output.get("text", str(output))
                 return str(output)
+            raise TaskExecutionError(
+                "Could not resolve referenced operation result from '{}'.".format(source_op_id)
+            )
+        if isinstance(text, str) and re.match(r"^@[A-Za-z0-9_\-]+\.(?:text|output)$", text.strip()):
+            raise TaskExecutionError(
+                "Unresolved placeholder text '{}' cannot be written directly.".format(text.strip())
+            )
         if text is not None:
             return str(text)
         return str(args.get("text", ""))
+
+    def _ensure_no_unresolved_reference_payload(self, args: Dict[str, Any]) -> None:
+        if args.get("from_operation"):
+            return
+        text = args.get("text")
+        if text is None:
+            return
+        source_id = self._extract_from_operation_reference(text)
+        if source_id:
+            args["from_operation"] = source_id
+            args.pop("text", None)
+            return
+        if isinstance(text, str):
+            stripped = text.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                raise TaskExecutionError(
+                    "Structured reference payload was not normalized before execution: '{}'.".format(stripped)
+                )
+
+    @staticmethod
+    def _select_line_for_spreadsheet_target(args: Dict[str, Any], output: Any) -> str:
+        cell = str(args.get("cell", "") or "").strip().upper()
+        if not cell:
+            return ""
+        match = re.match(r"^[A-Z]+([0-9]+)$", cell)
+        if not match:
+            return ""
+        row_index = int(match.group(1)) - 1
+        if row_index < 0:
+            return ""
+
+        text_blob = ""
+        if isinstance(output, dict):
+            text_blob = str(output.get("text", "") or "")
+        elif isinstance(output, str):
+            text_blob = output
+        else:
+            return ""
+
+        lines = [line.strip() for line in str(text_blob).splitlines() if line.strip()]
+        if len(lines) >= 2 and row_index < len(lines):
+            return lines[row_index]
+        return ""
 
     @staticmethod
     def _extract_from_operation_reference(value: Any) -> str:
@@ -647,6 +774,10 @@ class ActionAgent:
         plain_match = re.match(r"^\[?from_operation[:\s]+([A-Za-z0-9_\-]+)\]?$", text)
         if plain_match:
             return plain_match.group(1).strip()
+
+        at_ref_match = re.match(r"^@([A-Za-z0-9_\-]+)\.(?:text|output)$", text)
+        if at_ref_match:
+            return at_ref_match.group(1).strip()
 
         if text.startswith("{") and text.endswith("}"):
             try:

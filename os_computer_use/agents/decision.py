@@ -392,12 +392,43 @@ class DecisionAgent:
                 # 搜索结果虽然一般，但已经被后续有副作用的操作消费完成；
                 # 此时整单重跑通常只会重复写入/重复打开，不应由 decision 触发自动回滚式重试。
                 continue
+            if self._search_result_was_persisted(task_spec, execution_results, result):
+                continue
             reason = str(result.get("reason", "") or "").strip()
             query = str(result.get("query", operation.arguments.get("text", "")) or "").strip()
             if reason:
                 return "Browser search result for '{}' was not usable: {}".format(query, reason)
             return "Browser search result for '{}' was not usable.".format(query)
         return ""
+
+    def _search_result_was_persisted(
+        self,
+        task_spec: TaskSpec,
+        execution_results: Dict[str, Any],
+        search_result: Dict[str, Any],
+    ) -> bool:
+        search_text = str(search_result.get("text", "") or "").strip()
+        if not search_text:
+            return False
+        search_lines = [line.strip() for line in search_text.splitlines() if line.strip()]
+        if not search_lines:
+            return False
+
+        for operation in task_spec.operations:
+            if operation.kind != "spreadsheet.write_cell":
+                continue
+            result = execution_results.get(operation.id)
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+
+            written_lines = [str(line).strip() for line in result.get("written_lines", []) if str(line).strip()]
+            if written_lines and written_lines == search_lines[:len(written_lines)]:
+                return True
+
+            written_text = str(result.get("text", "") or "").strip()
+            if written_text and written_text == search_text:
+                return True
+        return False
 
     @staticmethod
     def _all_consumers_completed(consumers: List[Any], execution_results: Dict[str, Any]) -> bool:

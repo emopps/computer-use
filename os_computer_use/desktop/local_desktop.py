@@ -10,6 +10,7 @@ import asyncio
 import shlex
 import zipfile
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import List, Optional
 
 class LocalDesktop:
@@ -563,9 +564,16 @@ class LocalDesktop:
     async def _extract_search_results(self, query: str) -> str:
         if not self._page:
             return "搜索完成，但当前没有可读取的页面。"
+        if self._is_composition_title_query(query):
+            composition_titles = self._clean_extracted_text(
+                await self._extract_composition_titles_search_answer(query),
+                query,
+            )
+            if composition_titles:
+                return composition_titles
         if self._is_weather_query(query):
             weather_answer = self._clean_extracted_text(await self._extract_weather_search_answer(query), query)
-            if self._is_weather_quality_content(weather_answer, query):
+            if self._is_weather_quality_content(weather_answer, query) or self._is_weather_homepage_content(weather_answer, query):
                 return weather_answer
         instant_answer = self._clean_extracted_text(await self._extract_instant_answer(query), query)
         if self._is_quality_content(instant_answer, query):
@@ -585,6 +593,185 @@ class LocalDesktop:
     def _is_weather_query(query: str) -> bool:
         payload = str(query or "").strip()
         return bool(payload) and "天气" in payload
+
+    @staticmethod
+    def _is_composition_title_query(query: str) -> bool:
+        payload = str(query or "").strip()
+        if not payload:
+            return False
+        return "作文" in payload
+
+    async def _extract_composition_titles_search_answer(self, query: str) -> str:
+        if not self._page:
+            return ""
+        dom_titles = await self._extract_composition_titles_from_dom(query)
+        if dom_titles:
+            return "\n".join(dom_titles[:3])
+        candidate_texts: List[str] = []
+        try:
+            candidate_texts.extend(
+                await self._page.evaluate(
+                    """() => {
+                        const selectors = [
+                            '.result-op', '.c-container', '.result',
+                            '[class*="composition"]', '[class*="zuowen"]',
+                            '[class*="write"]', '#content_left'
+                        ];
+                        const items = [];
+                        for (const selector of selectors) {
+                            document.querySelectorAll(selector).forEach((el) => {
+                                const text = (el.innerText || '').trim();
+                                if (text && text.length > 10) items.push(text.slice(0, 4000));
+                            });
+                        }
+                        const bodyText = (document.body?.innerText || '').trim();
+                        if (bodyText) items.push(bodyText.slice(0, 12000));
+                        return items;
+                    }"""
+                ) or []
+            )
+        except Exception:
+            candidate_texts = []
+
+        titles = []
+        for text in candidate_texts:
+            for title in self._extract_composition_titles_from_text(text):
+                if title not in titles:
+                    titles.append(title)
+                if len(titles) >= 3:
+                    return "\n".join(titles[:3])
+        return "\n".join(titles[:3])
+
+    async def _extract_composition_titles_from_dom(self, query: str) -> List[str]:
+        if not self._page:
+            return []
+        try:
+            raw_titles = await self._page.evaluate(
+                """() => {
+                    const roots = [
+                        ...document.querySelectorAll('#content_left .result-op, #content_left .c-container, #content_left .result')
+                    ];
+                    const candidates = [];
+                    const seen = new Set();
+                    const push = (text, score) => {
+                        const normalized = (text || '').replace(/\\s+/g, ' ').trim();
+                        if (!normalized || seen.has(normalized)) return;
+                        seen.add(normalized);
+                        candidates.push({ text: normalized, score });
+                    };
+
+                    for (const root of roots.slice(0, 8)) {
+                        const rootText = (root.innerText || '').trim();
+                        const rootHtml = root.innerHTML || '';
+                        const hasCompositionSignal =
+                            /作文|范文|年级|字/.test(rootText) ||
+                            /zuowen|composition/i.test(rootHtml);
+                        if (!hasCompositionSignal) continue;
+
+                        const selectors = [
+                            'h3 a', 'h3', 'a',
+                            '[class*="title"]', '[class*="Title"]',
+                            '[class*="card"] [class*="name"]',
+                            '[class*="card"] span', '[class*="card"] div'
+                        ];
+                        for (const selector of selectors) {
+                            root.querySelectorAll(selector).forEach((el) => {
+                                const text = (el.innerText || el.textContent || '').trim();
+                                if (!text) return;
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width <= 0 || rect.height <= 0) return;
+                                let score = 0;
+                                if (selector.includes('h3')) score += 10;
+                                if (/title|Title/.test(selector)) score += 8;
+                                if (/作文|小学/.test(text)) score -= 6;
+                                if (/字|年级|分|日记|灯会|地球|未来/.test(text)) score += 4;
+                                if (text.length >= 2 && text.length <= 16) score += 6;
+                                if (/^[\\u4e00-\\u9fffA-Za-z0-9《》“”‘’()（）·—-]+$/.test(text)) score += 2;
+                                push(text, score);
+                            });
+                        }
+                    }
+
+                    candidates.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+                    return candidates.map(item => item.text).slice(0, 30);
+                }"""
+            ) or []
+        except Exception:
+            return []
+
+        titles: List[str] = []
+        for item in raw_titles:
+            normalized = self._normalize_composition_title(str(item or ""))
+            if not normalized:
+                continue
+            if normalized not in titles:
+                titles.append(normalized)
+            if len(titles) >= 3:
+                break
+        return titles
+
+    def _extract_composition_titles_from_text(self, text: str) -> List[str]:
+        payload = str(text or "").replace("\r", "\n")
+        lines = [re.sub(r"\s+", " ", line).strip() for line in payload.split("\n")]
+        lines = [line for line in lines if line]
+        titles: List[str] = []
+        blacklist_tokens = [
+            "百度", "搜索", "相关", "热搜", "登录", "更多", "作文大全", "精选",
+            "字数", "体裁", "年级", "不限", "查看更多", "推荐", "作文题",
+        ]
+
+        for index, line in enumerate(lines):
+            normalized = line.strip("：:- ").strip()
+            if not normalized:
+                continue
+            if any(token in normalized for token in blacklist_tokens):
+                continue
+            if len(normalized) < 2 or len(normalized) > 14:
+                continue
+            if re.search(r"\d", normalized):
+                continue
+            if normalized.endswith("作文") and len(normalized) > 8:
+                continue
+            next_line = lines[index + 1] if index + 1 < len(lines) else ""
+            prev_line = lines[index - 1] if index > 0 else ""
+            context_blob = "{} {}".format(prev_line, next_line)
+            if not (
+                re.search(r"\d+\s*字", context_blob)
+                or "分" in context_blob
+                or "作文" in context_blob
+                or "小学" in context_blob
+            ):
+                continue
+            normalized_title = self._normalize_composition_title(normalized)
+            if normalized_title and normalized_title not in titles:
+                titles.append(normalized_title)
+        return titles
+
+    def _normalize_composition_title(self, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        normalized = normalized.strip("：:- ").strip()
+        normalized = re.sub(r"^[《“\"']+", "", normalized)
+        normalized = re.sub(r"[》”\"']+$", "", normalized)
+        if not normalized:
+            return ""
+        blacklist_tokens = [
+            "百度", "搜索", "相关", "热搜", "登录", "更多", "作文大全", "精选",
+            "字数", "体裁", "年级", "不限", "查看更多", "推荐", "作文题", "小学生作文",
+            "百度教育作文", "相关搜索", "未来的地球作文", "小学作文-精选",
+        ]
+        if any(token == normalized or token in normalized for token in blacklist_tokens):
+            return ""
+        if len(normalized) < 2 or len(normalized) > 16:
+            return ""
+        if re.search(r"^\d+$", normalized):
+            return ""
+        if re.search(r"(第\d+[篇页]|[0-9]{3,}篇)", normalized):
+            return ""
+        if normalized.endswith("作文") and len(normalized) > 8:
+            return ""
+        if not re.search(r"[\u4e00-\u9fff]", normalized):
+            return ""
+        return normalized
 
     async def _extract_weather_search_answer(self, query: str) -> str:
         if not self._page:
@@ -624,13 +811,13 @@ class LocalDesktop:
             if summary:
                 summaries.append(summary)
         best = self._pick_best_query_text(summaries, query)
-        if self._is_weather_quality_content(best, query):
+        if self._is_weather_quality_content(best, query) or self._is_weather_homepage_content(best, query):
             return best
 
-        clicked = await self._click_and_extract_weather_result(query)
-        if clicked:
-            return clicked
-        return best
+        # 天气查询严格只解析搜索首页，不再点开任何结果页。
+        if best:
+            return best
+        return ""
 
     async def _click_and_extract_weather_result(self, query: str) -> str:
         if not self._page:
@@ -737,7 +924,49 @@ class LocalDesktop:
                     continue
                 candidates.append(self._format_weather_match(match, location))
 
+        if not candidates:
+            homepage_summary = self._extract_weather_homepage_summary(payload, location, terms)
+            if homepage_summary:
+                candidates.append(homepage_summary)
+
         return self._pick_best_query_text(candidates, query)
+
+    def _extract_weather_homepage_summary(self, payload: str, location: str, terms: List[str]) -> str:
+        weather_tokens = "晴|多云|阴|小雨|中雨|大雨|暴雨|雷阵雨|阵雨|雨夹雪|小雪|中雪|大雪|雾|霾|扬沙|浮尘"
+        lines = [re.sub(r"\s+", " ", line).strip() for line in payload.split("\n")]
+        lines = [line for line in lines if len(line) >= 4]
+
+        for index, line in enumerate(lines):
+            if location and location not in line and not any(term in line for term in terms):
+                continue
+            window = " ".join(lines[index:index + 6])
+            if not re.search(weather_tokens, window):
+                continue
+            temp_match = re.search(r"(-?\d{1,2}(?:\s*[~～\-至]\s*-?\d{1,2})?)\s*℃", window)
+            if not temp_match:
+                temp_match = re.search(r"气温\s*(-?\d{1,2}(?:\s*[~～\-至]\s*-?\d{1,2})?)", window)
+            if not temp_match:
+                continue
+            condition_match = re.search(weather_tokens, window)
+            wind_match = re.search(r"(?:[东北西南]{0,2}风\d{1,2}级|风力\d{1,2}级|微风)", window)
+            air_match = re.search(r"(空气质量[^\s，。,；;]{1,12})", window)
+            detail_parts = []
+            if condition_match:
+                detail_parts.append(condition_match.group(0))
+            detail_parts.append(re.sub(r"\s+", "", temp_match.group(0)))
+            if wind_match:
+                detail_parts.append(wind_match.group(0))
+            if air_match:
+                detail_parts.append(air_match.group(1))
+            place = location
+            if not place:
+                place_match = re.search(r"([^\s，。,；;]{1,8})(?:天气|今日天气|今天天气)", window)
+                if place_match:
+                    place = place_match.group(1)
+            if place:
+                return "{}：{}".format(place, "，".join(detail_parts))
+            return "，".join(detail_parts)
+        return ""
 
     @staticmethod
     def _format_weather_match(match, fallback_location: str) -> str:
@@ -771,6 +1000,18 @@ class LocalDesktop:
         if not re.search(r"晴|多云|阴|小雨|中雨|大雨|暴雨|雷阵雨|阵雨|雨夹雪|小雪|中雪|大雪|雾|霾|扬沙|浮尘", payload):
             return False
         return True
+
+    def _is_weather_homepage_content(self, text: str, query: str = "") -> bool:
+        payload = str(text or "").strip()
+        if not payload:
+            return False
+        if self._score_query_relevance(payload, query) <= 0:
+            return False
+        weather_tokens = ["晴", "多云", "阴", "小雨", "中雨", "大雨", "暴雨", "雷阵雨", "阵雨", "雾", "霾"]
+        has_weather = any(token in payload for token in weather_tokens)
+        has_temp = bool(re.search(r"\d{1,2}(?:\s*[~～\-至]\s*\d{1,2})?\s*℃", payload))
+        has_wind_or_air = any(token in payload for token in ["风", "级", "空气质量", "湿度"])
+        return has_weather and (has_temp or has_wind_or_air)
 
     async def _extract_instant_answer(self, query: str) -> str:
         if not self._page:
@@ -1341,6 +1582,111 @@ class LocalDesktop:
         else:
             print("未能找到 WPS 窗口")
         return False
+
+    def read_spreadsheet_cell(self, file_path: str, cell: str) -> str:
+        """直接从 xlsx 文件读取指定单元格文本，用于写入后的磁盘校验。"""
+        try:
+            with zipfile.ZipFile(file_path, "r") as workbook:
+                shared_strings = []
+                if "xl/sharedStrings.xml" in workbook.namelist():
+                    root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
+                    for item in root.findall(".//{*}si"):
+                        text = "".join(node.text or "" for node in item.findall(".//{*}t"))
+                        shared_strings.append(text)
+
+                sheet_paths = self._spreadsheet_sheet_paths(workbook)
+                for sheet_path in sheet_paths:
+                    if sheet_path not in workbook.namelist():
+                        continue
+                    sheet_root = ET.fromstring(workbook.read(sheet_path))
+                    for cell_node in sheet_root.findall(".//{*}c"):
+                        if str(cell_node.attrib.get("r", "")).upper() != str(cell).upper():
+                            continue
+                        return self._read_spreadsheet_cell_node(cell_node, shared_strings)
+        except Exception as exc:
+            print(f"读取表格单元格失败: {exc}")
+        return ""
+
+    def read_spreadsheet_vertical_range(self, file_path: str, start_cell: str, line_count: int) -> list:
+        values = []
+        if line_count <= 0:
+            return values
+        col_name, row_num = self._split_spreadsheet_cell_ref(start_cell)
+        if not col_name or row_num <= 0:
+            return values
+        for offset in range(line_count):
+            values.append(self.read_spreadsheet_cell(file_path, f"{col_name}{row_num + offset}"))
+        return values
+
+    @staticmethod
+    def _split_spreadsheet_cell_ref(cell: str) -> tuple:
+        match = re.match(r"^([A-Za-z]+)([0-9]+)$", str(cell or "").strip())
+        if not match:
+            return "", 0
+        return match.group(1).upper(), int(match.group(2))
+
+    def _spreadsheet_sheet_paths(self, workbook) -> list:
+        default_path = "xl/worksheets/sheet1.xml"
+        try:
+            if "xl/workbook.xml" not in workbook.namelist():
+                return [default_path]
+
+            rel_targets = {}
+            if "xl/_rels/workbook.xml.rels" in workbook.namelist():
+                rel_root = ET.fromstring(workbook.read("xl/_rels/workbook.xml.rels"))
+                for rel in rel_root.findall(".//{*}Relationship"):
+                    rel_id = str(rel.attrib.get("Id", "")).strip()
+                    target = str(rel.attrib.get("Target", "")).strip()
+                    if not rel_id or not target:
+                        continue
+                    normalized = target.lstrip("/")
+                    if not normalized.startswith("xl/"):
+                        normalized = "xl/" + normalized.lstrip("./")
+                    rel_targets[rel_id] = normalized
+
+            workbook_root = ET.fromstring(workbook.read("xl/workbook.xml"))
+            paths = []
+            for sheet in workbook_root.findall(".//{*}sheet"):
+                rel_id = (
+                    sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    or sheet.attrib.get("id")
+                    or ""
+                )
+                sheet_path = rel_targets.get(str(rel_id).strip())
+                if sheet_path:
+                    paths.append(sheet_path)
+
+            if paths:
+                return paths
+        except Exception:
+            pass
+        return [default_path]
+
+    def _read_spreadsheet_cell_node(self, cell_node, shared_strings: list) -> str:
+        cell_type = str(cell_node.attrib.get("t", "") or "").strip()
+        if cell_type == "inlineStr":
+            return "".join(node.text or "" for node in cell_node.findall(".//{*}is//{*}t"))
+
+        value_node = cell_node.find("{*}v")
+        raw_value = ""
+        if value_node is not None and value_node.text is not None:
+            raw_value = str(value_node.text)
+
+        if cell_type == "s":
+            try:
+                index = int(raw_value)
+            except Exception:
+                return ""
+            return shared_strings[index] if 0 <= index < len(shared_strings) else ""
+
+        if raw_value:
+            return raw_value
+
+        formula_text = "".join(node.text or "" for node in cell_node.findall(".//{*}f"))
+        if formula_text:
+            return formula_text
+
+        return "".join(node.text or "" for node in cell_node.findall(".//{*}t"))
 
     async def open_terminal(self):
         """打开一个新的终端窗口。

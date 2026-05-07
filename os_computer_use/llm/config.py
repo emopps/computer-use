@@ -15,7 +15,7 @@ LOCAL_REASONING_MODEL_PATH = os.getenv(
 ).strip()
 OPENROUTER_REASONING_MODEL = os.getenv(
     "OPENROUTER_MODEL",
-    "openai/gpt-oss-20b:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
 ).strip()
 OPENROUTER_VISION_MODEL = os.getenv(
     "OPENROUTER_VISION_MODEL",

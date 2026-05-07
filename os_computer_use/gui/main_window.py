@@ -5,10 +5,13 @@ import json
 import os
 import re
 import sys
-from typing import Optional
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import QObject, QPoint, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication,
     QFrame,
@@ -97,10 +100,13 @@ class AssistantCard(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("assistantCard")
-        self._lines: list[str] = []
-        self._commands: list[tuple[str, str]] = []
-        self._command_keys: set[str] = set()
-        self._stream_blocks: list[QWidget] = []
+        self._lines: List[str] = []
+        self._commands: List[Tuple[str, str]] = []
+        self._command_keys: Set[str] = set()
+        self._stream_blocks: List[QWidget] = []
+        self._operation_rows: Dict[str, OperationStatusRow] = {}
+        self._operation_snapshots: List[Dict[str, str]] = []
+        self._stream_snapshots: List[Dict[str, str]] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
@@ -146,6 +152,7 @@ class AssistantCard(QFrame):
             return
         palette = {
             "default": "#364152",
+            "muted": "#5d6b7c",
             "cyan": "#2d86eb",
             "green": "#1f8f5f",
             "yellow": "#a36a00",
@@ -156,11 +163,12 @@ class AssistantCard(QFrame):
         }
         safe = html.escape(text)
         html_text = (
-            f'<div style="color:{palette.get(color, "#364152")}; margin-bottom:6px; background:transparent;">{safe}</div>'
+            f'<div style="color:{palette.get(color, "#364152")}; margin-bottom:6px; background:transparent; font-weight:500;">{safe}</div>'
         )
         self._lines.append(html_text)
         self._lines = self._lines[-40:]
         self._append_html_line(html_text)
+        self._stream_snapshots.append({"type": "html", "html": html_text})
 
     def add_command(self, text: str, tone: str = "run") -> None:
         key = f"{tone}:{text}"
@@ -184,6 +192,29 @@ class AssistantCard(QFrame):
         self._lines.append(html_text)
         self._lines = self._lines[-60:]
         self._append_html_line(html_text)
+        self._stream_snapshots.append({"type": "html", "html": html_text})
+
+    def upsert_operation(self, operation_id: str, label: str, status: str) -> None:
+        row = self._operation_rows.get(operation_id)
+        if row is None:
+            row = OperationStatusRow(label)
+            self._operation_rows[operation_id] = row
+            self._append_block(row)
+            self._operation_snapshots.append({"id": operation_id, "label": label, "status": status})
+            self._stream_snapshots.append(
+                {"type": "operation", "id": operation_id, "label": label, "status": status}
+            )
+        row.set_status(status)
+        for snapshot in self._operation_snapshots:
+            if snapshot.get("id") == operation_id:
+                snapshot["label"] = label
+                snapshot["status"] = status
+                break
+        for snapshot in self._stream_snapshots:
+            if snapshot.get("type") == "operation" and snapshot.get("id") == operation_id:
+                snapshot["label"] = label
+                snapshot["status"] = status
+                break
 
     def set_meta(self, text: str) -> None:
         self.meta_label.setText(text)
@@ -192,10 +223,110 @@ class AssistantCard(QFrame):
     def add_inline_widget(self, widget: QWidget) -> None:
         self._append_block(widget)
 
-    def restore_lines(self, lines: list[str]) -> None:
+    def restore_lines(self, lines: List[str]) -> None:
         self._lines = list(lines)
         for html_text in self._lines:
             self._append_html_line(html_text)
+
+    def restore_operations(self, operations: List[Dict[str, str]]) -> None:
+        for item in operations:
+            op_id = str(item.get("id", "") or "")
+            label = str(item.get("label", "") or "")
+            status = str(item.get("status", "") or "")
+            if not op_id or not label:
+                continue
+            self.upsert_operation(op_id, label, status)
+
+    def operation_snapshots(self) -> List[Dict[str, str]]:
+        return [dict(item) for item in self._operation_snapshots]
+
+    def stream_snapshots(self) -> List[Dict[str, str]]:
+        return [dict(item) for item in self._stream_snapshots]
+
+    def restore_stream(self, stream: List[Dict[str, str]]) -> None:
+        self._stream_snapshots = []
+        self._lines = []
+        self._operation_snapshots = []
+        self._operation_rows = {}
+        for item in stream:
+            item_type = str(item.get("type", "") or "")
+            if item_type == "html":
+                html_text = str(item.get("html", "") or "")
+                if not html_text:
+                    continue
+                self._lines.append(html_text)
+                self._append_html_line(html_text)
+                self._stream_snapshots.append({"type": "html", "html": html_text})
+            elif item_type == "operation":
+                op_id = str(item.get("id", "") or "")
+                label = str(item.get("label", "") or "")
+                status = str(item.get("status", "") or "")
+                if not op_id or not label:
+                    continue
+                row = OperationStatusRow(label)
+                self._operation_rows[op_id] = row
+                self._append_block(row)
+                row.set_status(status)
+                snapshot = {"id": op_id, "label": label, "status": status}
+                self._operation_snapshots.append(snapshot)
+                self._stream_snapshots.append({"type": "operation", **snapshot})
+
+
+class OperationStatusRow(QFrame):
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.setObjectName("operationRow")
+        self._running_since = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._tick)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
+
+        self.dot = QLabel()
+        self.dot.setObjectName("operationDot")
+        self.dot.setFixedSize(8, 8)
+
+        self.title = QLabel(label)
+        self.title.setObjectName("operationTitle")
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("operationStatus")
+        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(self.dot, 0, Qt.AlignTop)
+        layout.addWidget(self.title, 1)
+        layout.addWidget(self.status_label, 0, Qt.AlignRight)
+
+    def _tick(self) -> None:
+        if self._running_since <= 0:
+            return
+        elapsed = max(0, int(time.monotonic() - self._running_since))
+        self.status_label.setText("Running {}s".format(elapsed))
+
+    def set_status(self, status: str) -> None:
+        if status == "running":
+            if self._running_since <= 0:
+                self._running_since = time.monotonic()
+            if not self._timer.isActive():
+                self._timer.start()
+            self.status_label.setText("Running 0s")
+            self.setProperty("state", "running")
+        elif status == "completed":
+            elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else 0
+            self._timer.stop()
+            self._running_since = 0.0
+            self.status_label.setText("Finished {}s".format(elapsed) if elapsed else "Finished")
+            self.setProperty("state", "completed")
+        else:
+            self._timer.stop()
+            self._running_since = 0.0
+            self.status_label.setText("Failed")
+            self.setProperty("state", "failed")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
 
 class AuthorizationCard(QFrame):
@@ -277,28 +408,39 @@ class MainWindow(QMainWindow):
 
         self._assistant_card: Optional[AssistantCard] = None
         self._conversation_count = 0
-        self._conversation_buttons: list[QPushButton] = []
+        self._conversation_buttons: List[QPushButton] = []
         self._active_conversation_button: Optional[QPushButton] = None
-        self._conversation_data: dict[QPushButton, dict] = {}
-        self._message_widgets: list[QWidget] = []
+        self._conversation_data: Dict[QPushButton, dict] = {}
+        self._message_widgets: List[QWidget] = []
         self._awaiting_clarification = False
         self._awaiting_authorization = False
         self._pending_input_mode = ""
         self._active_authorization_card: Optional[AuthorizationCard] = None
-        self._pending_authorization: Optional[dict[str, str]] = None
+        self._pending_authorization: Optional[Dict[str, str]] = None
         self._running = False
         self._warmup_ready = False
         self._clarification_resume_active = False
-        self._seen_operation_states: set[tuple[str, str]] = set()
+        self._seen_operation_states: Set[Tuple[str, str]] = set()
+        self._plan_cycle = 0
+        self._status_base_message = "正在启动并预加载模型..."
+        self._status_started_at = 0.0
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(250)
+        self._status_timer.timeout.connect(self._refresh_status_bar)
+        self._history_store_path = Path("./history/gui_conversations.json")
+        self._legacy_history_store_path = Path("./memory/gui_conversations.json")
 
         self._build_ui()
-        self._create_conversation("当前任务")
+        self._load_conversation_history()
         QTimer.singleShot(0, self._place_window)
         QTimer.singleShot(0, self._start_warmup)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._running:
             self._worker.cancel_task()
+        if self._active_conversation_button is not None:
+            self._save_current_conversation_state(self._active_conversation_button)
+        self._persist_conversation_history()
         self._worker_thread.quit()
         self._worker_thread.wait(5000)
         super().closeEvent(event)
@@ -338,12 +480,32 @@ class MainWindow(QMainWindow):
         self.new_chat_button.setObjectName("newChatButton")
         sidebar_layout.addWidget(self.new_chat_button)
 
+        current_label = QLabel("当前")
+        current_label.setObjectName("sidebarSectionTitle")
+        sidebar_layout.addWidget(current_label)
+
+        self.current_conversation_host = QWidget()
+        self.current_conversation_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.current_conversation_layout = QVBoxLayout(self.current_conversation_host)
+        self.current_conversation_layout.setContentsMargins(0, 0, 0, 0)
+        self.current_conversation_layout.setSpacing(10)
+        sidebar_layout.addWidget(self.current_conversation_host)
+
+        history_label = QLabel("历史")
+        history_label.setObjectName("sidebarSectionTitle")
+        sidebar_layout.addWidget(history_label)
+
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
+        self.history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.history_scroll.setObjectName("historyScroll")
         self.conversation_list = QWidget()
         self.conversation_list_layout = QVBoxLayout(self.conversation_list)
         self.conversation_list_layout.setContentsMargins(0, 0, 0, 0)
         self.conversation_list_layout.setSpacing(10)
-        sidebar_layout.addWidget(self.conversation_list)
-        sidebar_layout.addStretch(1)
+        self.conversation_list_layout.setAlignment(Qt.AlignTop)
+        self.history_scroll.setWidget(self.conversation_list)
+        sidebar_layout.addWidget(self.history_scroll, 1)
         page.addWidget(sidebar)
 
         main = QWidget()
@@ -352,9 +514,9 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(14)
         page.addWidget(main, 1)
 
-        hero = QLabel("欢迎使用开放式桌面智能体")
+        hero = QLabel("Open Computer Use")
         hero.setObjectName("heroTitle")
-        hero.setAlignment(Qt.AlignCenter)
+        hero.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         main_layout.addWidget(hero)
 
         self.chat_scroll = QScrollArea()
@@ -395,7 +557,7 @@ class MainWindow(QMainWindow):
 
         self.status_bar = QStatusBar(self)
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("正在启动并预加载模型...")
+        self._set_status_message("正在启动并预加载模型...")
 
         self.new_chat_button.clicked.connect(self._handle_new_chat)
         self.clear_button.clicked.connect(self.prompt_edit.clear)
@@ -422,6 +584,12 @@ class MainWindow(QMainWindow):
                 background: #fbfcfe;
                 border-right: 1px solid #e7ebf2;
             }
+            #sidebarSectionTitle {
+                color: #8a94a6;
+                font-size: 12px;
+                font-weight: 700;
+                padding: 4px 4px 0 4px;
+            }
             #newChatButton {
                 min-height: 40px;
                 border: none;
@@ -433,13 +601,14 @@ class MainWindow(QMainWindow):
             }
             QPushButton[conversation="true"] {
                 min-height: 38px;
+                max-height: 38px;
                 text-align: left;
                 padding: 0 14px;
                 border: none;
                 border-radius: 10px;
                 background: #eef4fb;
                 color: #4c596b;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 700;
             }
             QPushButton[conversation="true"][active="true"] {
@@ -448,6 +617,10 @@ class MainWindow(QMainWindow):
             }
             QPushButton[conversation="true"][pinned="true"] {
                 border: 1px solid #9fcbff;
+            }
+            #historyScroll {
+                border: none;
+                background: transparent;
             }
             #heroTitle {
                 margin-top: 8px;
@@ -495,8 +668,46 @@ class MainWindow(QMainWindow):
                 line-height: 1.6;
             }
             #assistantMeta {
-                color: #8d96a5;
+                color: #6f7c8f;
                 font-size: 13px;
+            }
+            #operationRow {
+                background: #f7fbff;
+                border: 1px solid #dce8f7;
+                border-radius: 10px;
+            }
+            #operationRow[state="running"] {
+                border: 1px solid #b9dafc;
+                background: #eef7ff;
+            }
+            #operationRow[state="completed"] {
+                border: 1px solid #cfe9da;
+                background: #f1fbf5;
+            }
+            #operationRow[state="failed"] {
+                border: 1px solid #f0d4d4;
+                background: #fff4f4;
+            }
+            #operationDot {
+                background: #3b82f6;
+                border-radius: 4px;
+            }
+            #operationTitle {
+                color: #364152;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            #operationStatus {
+                color: #2d86eb;
+                font-size: 12px;
+                font-weight: 600;
+                min-width: 96px;
+            }
+            #operationRow[state="completed"] #operationStatus {
+                color: #1f8f5f;
+            }
+            #operationRow[state="failed"] #operationStatus {
+                color: #d04f4f;
             }
             QAbstractScrollArea {
                 background: transparent;
@@ -597,11 +808,11 @@ class MainWindow(QMainWindow):
         self.stop_button.setVisible(busy)
         self.stop_button.setEnabled(busy)
         if busy:
-            self.status_bar.showMessage("执行中...")
+            self._set_status_message("执行中...", timed=True)
         elif self._warmup_ready:
-            self.status_bar.showMessage("就绪")
+            self._set_status_message("就绪")
         else:
-            self.status_bar.showMessage("正在启动并预加载模型...")
+            self._set_status_message("正在启动并预加载模型...")
 
     def _start_warmup(self) -> None:
         self.run_button.setEnabled(False)
@@ -614,39 +825,59 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.clear_button.setEnabled(True)
         self.prompt_edit.setEnabled(True)
-        self.status_bar.showMessage(message if ok else "预加载失败，发送任务时会继续尝试")
+        self._set_status_message(message if ok else "预加载失败，发送任务时会继续尝试")
 
     def _cancel_task(self) -> None:
         if not self._running:
             return
-        self.status_bar.showMessage("正在停止任务...")
+        self._set_status_message("正在停止任务...")
         self._worker.cancel_task()
 
     def _handle_new_chat(self) -> None:
         self._conversation_count += 1
         self._create_conversation(f"新对话 {self._conversation_count}")
         self._reset_chat_content()
+        self._persist_conversation_history()
 
-    def _create_conversation(self, title: str) -> None:
+    def _create_conversation(
+        self,
+        title: str,
+        *,
+        conversation_id: str = "",
+        pinned: bool = False,
+        state: Optional[dict] = None,
+        activate: bool = True,
+    ) -> QPushButton:
         button = QPushButton(title)
         button.setProperty("conversation", True)
         button.setProperty("active", False)
-        button.setProperty("pinned", False)
+        button.setProperty("pinned", bool(pinned))
+        button.setProperty("is_history", conversation_id.startswith("session::"))
+        if not conversation_id:
+            conversation_id = "conv_{}".format(int(time.time() * 1000))
+        button.setProperty("conversation_id", conversation_id)
         button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(title)
         button.setContextMenuPolicy(Qt.CustomContextMenu)
         button.clicked.connect(lambda: self._activate_conversation(button))
         button.customContextMenuRequested.connect(
             lambda pos, target=button: self._show_conversation_menu(target, pos)
         )
-        self.conversation_list_layout.addWidget(button)
         self._conversation_buttons.append(button)
-        self._conversation_data[button] = {
+        self._conversation_data[button] = state or {
             "messages": [],
             "awaiting_clarification": False,
             "awaiting_authorization": False,
             "pending_input_mode": "",
+            "pending_authorization": None,
+            "session_memory_dir": "",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
-        self._activate_conversation(button)
+        self._sync_conversation_button_text(button, title)
+        self._attach_conversation_button(button)
+        if activate:
+            self._activate_conversation(button)
+        return button
 
     def _activate_conversation(self, button: QPushButton) -> None:
         if self._active_conversation_button is not None:
@@ -657,6 +888,7 @@ class MainWindow(QMainWindow):
             item.style().polish(item)
         self._active_conversation_button = button
         self._load_conversation_state(button)
+        self._persist_conversation_history()
 
     def _show_conversation_menu(self, button: QPushButton, pos: QPoint) -> None:
         menu = QMenu(self)
@@ -674,13 +906,15 @@ class MainWindow(QMainWindow):
     def _rename_conversation(self, button: QPushButton) -> None:
         text, ok = QInputDialog.getText(self, "重命名对话", "新的对话名称：", text=button.text())
         if ok and text.strip():
-            button.setText(text.strip())
+            self._sync_conversation_button_text(button, text.strip())
+            self._persist_conversation_history()
 
     def _toggle_pin_conversation(self, button: QPushButton) -> None:
         button.setProperty("pinned", not bool(button.property("pinned")))
         button.style().unpolish(button)
         button.style().polish(button)
         self._reorder_conversations()
+        self._persist_conversation_history()
 
     def _delete_conversation(self, button: QPushButton) -> None:
         if len(self._conversation_buttons) <= 1:
@@ -694,15 +928,25 @@ class MainWindow(QMainWindow):
         self._reorder_conversations()
         if self._conversation_buttons:
             self._activate_conversation(self._conversation_buttons[0])
+        self._persist_conversation_history()
 
     def _reorder_conversations(self) -> None:
+        while self.current_conversation_layout.count():
+            self.current_conversation_layout.takeAt(0)
         while self.conversation_list_layout.count():
             self.conversation_list_layout.takeAt(0)
-        pinned = [b for b in self._conversation_buttons if bool(b.property("pinned"))]
-        normal = [b for b in self._conversation_buttons if not bool(b.property("pinned"))]
-        self._conversation_buttons = pinned + normal
-        for button in self._conversation_buttons:
+        current_buttons = [b for b in self._conversation_buttons if not bool(b.property("is_history"))]
+        history_buttons = [b for b in self._conversation_buttons if bool(b.property("is_history"))]
+        pinned = [b for b in history_buttons if bool(b.property("pinned"))]
+        normal = [b for b in history_buttons if not bool(b.property("pinned"))]
+        history_buttons = pinned + normal
+        self._conversation_buttons = current_buttons + history_buttons
+        for button in current_buttons:
+            self.current_conversation_layout.addWidget(button)
+        for button in history_buttons:
             self.conversation_list_layout.addWidget(button)
+        self.conversation_list_layout.addStretch(1)
+        self._persist_conversation_history()
 
     def _reset_chat_content(self) -> None:
         while self.chat_layout.count() > 0:
@@ -753,10 +997,6 @@ class MainWindow(QMainWindow):
         self._update_message_widths()
         self._scroll_bottom()
 
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self._update_message_widths()
-
     def _update_message_widths(self) -> None:
         viewport = self.chat_scroll.viewport()
         if viewport is None:
@@ -799,8 +1039,9 @@ class MainWindow(QMainWindow):
 
         if self._active_conversation_button is not None:
             text = prompt[:16] + ("..." if len(prompt) > 16 else "")
-            self._active_conversation_button.setText(text)
+            self._sync_conversation_button_text(self._active_conversation_button, text)
             self._save_current_conversation_state(self._active_conversation_button)
+            self._persist_conversation_history()
 
         self.prompt_edit.clear()
         self._bridge.process_prompt.emit(prompt)
@@ -850,7 +1091,7 @@ class MainWindow(QMainWindow):
         if "Planning task" in text:
             if self._clarification_resume_active:
                 return
-            card.append_text("\u6211\u5148\u7406\u89e3\u4f60\u7684\u4efb\u52a1\uff0c\u518d\u62c6\u89e3\u6267\u884c\u987a\u5e8f\u3002", "cyan")
+            card.append_text("\u6211\u6b63\u5728\u5224\u65ad\u5f53\u524d\u6700\u5408\u9002\u7684\u4e0b\u4e00\u6b65\u3002", "cyan")
         elif re.match(r"^Operation\s+\S+\s+failed:", text):
             return
         elif "failed" in text.lower():
@@ -873,14 +1114,18 @@ class MainWindow(QMainWindow):
 
     def _load_plan(self, summary: str, operations: list) -> None:
         self._clarification_resume_active = False
+        self._plan_cycle += 1
+        self._seen_operation_states.clear()
         card = self._ensure_assistant_card()
         card.set_meta("")
-        card.append_text("\u6211\u5df2\u7ecf\u7406\u89e3\u4efb\u52a1\uff0c\u8ba1\u5212\u8fd9\u6837\u6267\u884c\uff1a", "blue")
+        card.append_text("\u6211\u5df2\u7ecf\u7406\u89e3\u4efb\u52a1\u3002", "blue")
         if operations:
-            for index, operation in enumerate(operations, 1):
-                card.append_text("{}. {}".format(index, self._describe_operation(operation)), "default")
+            card.append_text(
+                "\u63a5\u4e0b\u6765\u5148\u505a\u8fd9\u4e00\u6b65\uff1a{}".format(self._describe_operation(operations[0])),
+                "muted",
+            )
         elif summary:
-            card.append_text(summary, "default")
+            card.append_text(summary, "green")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
         self._scroll_bottom()
@@ -888,19 +1133,20 @@ class MainWindow(QMainWindow):
     def _update_operation(self, operation_id: str, kind: str, status: str, error: str) -> None:
         if self._assistant_card is None:
             return
-        state_key = (operation_id, status)
+        display_operation_id = "{}:{}".format(self._plan_cycle, operation_id)
+        state_key = (display_operation_id, status)
         if state_key in self._seen_operation_states:
             return
         self._seen_operation_states.add(state_key)
         label = self._operation_label(kind or operation_id)
         if status == "running":
-            self._assistant_card.add_command(f"{label} \u8fdb\u884c\u4e2d", "run")
+            self._assistant_card.upsert_operation(display_operation_id, label, "running")
         elif status == "completed":
-            self._assistant_card.add_command(f"{label} \u5df2\u5b8c\u6210", "done")
+            self._assistant_card.upsert_operation(display_operation_id, label, "completed")
         elif error:
             error = self._localize_runtime_text(error)
             self._assistant_card.append_text(f"\u6b65\u9aa4 {operation_id} \u5931\u8d25\uff1a{error}", "red")
-            self._assistant_card.add_command(f"{operation_id} \u5931\u8d25", "warn")
+            self._assistant_card.upsert_operation(display_operation_id, label, "failed")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
 
@@ -922,7 +1168,7 @@ class MainWindow(QMainWindow):
         return mapping.get(str(kind or ""), str(kind or "执行步骤"))
 
     def _show_status(self, message: str) -> None:
-        self.status_bar.showMessage(message)
+        self._set_status_message(message)
 
     def _ask_clarification(self, question: str) -> None:
         self._awaiting_clarification = True
@@ -935,7 +1181,7 @@ class MainWindow(QMainWindow):
         card.append_text(question, "yellow")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self.status_bar.showMessage("\u8bf7\u5728\u4e0b\u65b9\u8f93\u5165\u8865\u5145\u4fe1\u606f\u540e\u53d1\u9001")
+        self._set_status_message("\u8bf7\u5728\u4e0b\u65b9\u8f93\u5165\u8865\u5145\u4fe1\u606f\u540e\u53d1\u9001")
 
     def _clarification_consumed(self) -> None:
         self._assistant_card = AssistantCard()
@@ -943,7 +1189,7 @@ class MainWindow(QMainWindow):
         self._seen_operation_states.clear()
         self._insert_message(self._assistant_card, False)
         self._assistant_card.append_text("\u5df2\u6536\u5230\u4f60\u7684\u8865\u5145\u4fe1\u606f\uff0c\u6b63\u5728\u7ee7\u7eed\u89c4\u5212\u3002", "cyan")
-        self.status_bar.showMessage("\u5df2\u6536\u5230\u4f60\u7684\u8865\u5145\u4fe1\u606f\uff0c\u6b63\u5728\u7ee7\u7eed\u89c4\u5212")
+        self._set_status_message("\u5df2\u6536\u5230\u4f60\u7684\u8865\u5145\u4fe1\u606f\uff0c\u6b63\u5728\u7ee7\u7eed\u89c4\u5212")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
         self._scroll_bottom()
@@ -970,7 +1216,7 @@ class MainWindow(QMainWindow):
                 self._save_current_conversation_state(self._active_conversation_button)
 
         self._mount_authorization_card(card, action_type, details, decide)
-        self.status_bar.showMessage("\u8bf7\u786e\u8ba4\u662f\u5426\u5141\u8bb8\u6267\u884c\u8be5\u6b65\u9aa4")
+        self._set_status_message("\u8bf7\u786e\u8ba4\u662f\u5426\u5141\u8bb8\u6267\u884c\u8be5\u6b65\u9aa4")
 
     def _mount_authorization_card(self, card: AssistantCard, action_type: str, details: str, on_decide) -> None:
         auth_widget = AuthorizationCard(action_type, details, on_decide)
@@ -1055,20 +1301,24 @@ class MainWindow(QMainWindow):
         self._clarification_resume_active = False
         self._active_authorization_card = None
         self._pending_authorization = None
+        if self._active_conversation_button is not None:
+            conversation_state = dict(self._conversation_data.get(self._active_conversation_button, {}) or {})
+            conversation_state["session_memory_dir"] = str(payload.get("session_memory_dir", "") or "")
+            conversation_state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self._conversation_data[self._active_conversation_button] = conversation_state
         evaluation = payload.get("evaluation", {})
         if self._assistant_card is not None:
             satisfied = bool(evaluation.get("satisfied", True))
             reason = self._localize_runtime_text(str(evaluation.get("reason", "") or ""))
             if satisfied:
                 self._assistant_card.append_text("\u6574\u4e2a\u4efb\u52a1\u5df2\u7ecf\u5b8c\u6210\u3002", "green")
-                if reason and reason not in {"not executed", ""}:
-                    self._assistant_card.append_text(f"\u7ed3\u679c\u8bc4\u4f30\uff1a{reason}", "gray")
             else:
                 self._assistant_card.append_text("\u6267\u884c\u5df2\u7ed3\u675f\uff0c\u4f46\u7ed3\u679c\u6821\u9a8c\u672a\u901a\u8fc7\u3002", "yellow")
                 if reason and reason not in {"not executed", ""}:
                     self._assistant_card.append_text(f"\u672a\u901a\u8fc7\u539f\u56e0\uff1a{reason}", "yellow")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
+            self._persist_conversation_history()
 
     def _task_failed(self, error: str) -> None:
         error = self._localize_runtime_text(error)
@@ -1084,7 +1334,8 @@ class MainWindow(QMainWindow):
             self._assistant_card.add_command("\u4efb\u52a1\u4e2d\u65ad", "warn")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self.status_bar.showMessage("\u4efb\u52a1\u5df2\u53d6\u6d88" if "\u53d6\u6d88" in str(error) else "\u4efb\u52a1\u5931\u8d25")
+            self._persist_conversation_history()
+        self._set_status_message("\u4efb\u52a1\u5df2\u53d6\u6d88" if "\u53d6\u6d88" in str(error) else "\u4efb\u52a1\u5931\u8d25")
 
     def _save_current_conversation_state(self, button: QPushButton) -> None:
         messages = []
@@ -1105,8 +1356,10 @@ class MainWindow(QMainWindow):
                     messages.append(
                         {
                             "type": "assistant",
+                            "stream": widget.stream_snapshots(),
                             "lines": list(widget._lines),
                             "meta": widget.meta_label.text(),
+                            "operations": widget.operation_snapshots(),
                         }
                     )
         self._conversation_data[button] = {
@@ -1115,6 +1368,10 @@ class MainWindow(QMainWindow):
             "awaiting_authorization": self._awaiting_authorization,
             "pending_input_mode": self._pending_input_mode,
             "pending_authorization": dict(self._pending_authorization or {}),
+            "session_memory_dir": str(
+                self._conversation_data.get(button, {}).get("session_memory_dir", "") or ""
+            ),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
     def _load_conversation_state(self, button: QPushButton) -> None:
@@ -1132,7 +1389,12 @@ class MainWindow(QMainWindow):
                 self._insert_message(box, True)
             elif message.get("type") == "assistant":
                 card = AssistantCard()
-                card.restore_lines(list(message.get("lines", [])))
+                stream = list(message.get("stream", []) or [])
+                if stream:
+                    card.restore_stream(stream)
+                else:
+                    card.restore_lines(list(message.get("lines", [])))
+                    card.restore_operations(list(message.get("operations", [])))
                 card.set_meta("")
                 self._assistant_card = card
                 self._insert_message(card, False)
@@ -1142,6 +1404,122 @@ class MainWindow(QMainWindow):
                 self._pending_authorization.get("details", ""),
             )
         self.prompt_edit.setFocus()
+
+    def _load_conversation_history(self) -> None:
+        archive = self._read_conversation_archive()
+        conversations = archive.get("conversations", []) or []
+        self._conversation_count += 1
+        target_button = self._create_conversation("新对话 {}".format(self._conversation_count), activate=False)
+        if not conversations:
+            self._activate_conversation(target_button)
+            self._persist_conversation_history()
+            return
+
+        conversations.sort(key=lambda item: str(item.get("updated_at", "") or ""), reverse=True)
+        for entry in conversations:
+            state = dict(entry.get("state", {}) or {})
+            self._create_conversation(
+                str(entry.get("title", "历史会话") or "历史会话"),
+                conversation_id=str(entry.get("id", "") or ""),
+                pinned=bool(entry.get("pinned", False)),
+                state=state,
+                activate=False,
+            )
+
+        self._reorder_conversations()
+        self._activate_conversation(target_button)
+
+    def _read_conversation_archive(self) -> dict:
+        source_path = self._history_store_path
+        if not source_path.exists() and self._legacy_history_store_path.exists():
+            source_path = self._legacy_history_store_path
+        if not source_path.exists():
+            return {"conversations": [], "last_active_id": "", "version": 1}
+        try:
+            payload = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"conversations": [], "last_active_id": "", "version": 1}
+        if not isinstance(payload, dict):
+            return {"conversations": [], "last_active_id": "", "version": 1}
+        payload.setdefault("conversations", [])
+        payload.setdefault("last_active_id", "")
+        payload["version"] = 1
+        payload["conversations"] = [
+            item
+            for item in payload.get("conversations", [])
+            if isinstance(item, dict) and not str(item.get("id", "") or "").startswith("session::")
+        ]
+        return payload
+
+    def _persist_conversation_history(self) -> None:
+        try:
+            self._history_store_path.parent.mkdir(parents=True, exist_ok=True)
+            conversations = []
+            for button in self._conversation_buttons:
+                if not bool(button.property("is_history")) and not self._conversation_data.get(button, {}).get("messages"):
+                    continue
+                state = dict(self._conversation_data.get(button, {}) or {})
+                conversations.append(
+                    {
+                        "id": str(button.property("conversation_id") or ""),
+                        "title": button.text(),
+                        "pinned": bool(button.property("pinned")),
+                        "updated_at": str(state.get("updated_at", "") or ""),
+                        "state": state,
+                    }
+                )
+            payload = {
+                "version": 1,
+                "last_active_id": str(
+                    self._active_conversation_button.property("conversation_id")
+                    if self._active_conversation_button is not None
+                    else ""
+                ),
+                "conversations": conversations,
+            }
+            self._history_store_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _build_history_line_html(text: str, color: str = "default") -> str:
+        palette = {
+            "default": "#364152",
+            "muted": "#5d6b7c",
+            "cyan": "#2d86eb",
+            "green": "#1f8f5f",
+            "yellow": "#a36a00",
+            "red": "#d04f4f",
+            "gray": "#7b8596",
+            "blue": "#3f7cff",
+            "magenta": "#7b58d0",
+        }
+        safe = html.escape(str(text or "").strip())
+        return '<div style="color:{}; margin-bottom:6px; background:transparent;">{}</div>'.format(
+            palette.get(color, "#364152"),
+            safe,
+        )
+
+    def _sync_conversation_button_text(self, button: QPushButton, title: str) -> None:
+        button.setToolTip(title)
+        metrics = QFontMetrics(button.font())
+        available_width = max(72, button.width() - 28) if button.width() > 0 else 100
+        button.setText(metrics.elidedText(title, Qt.ElideRight, available_width))
+
+    def _attach_conversation_button(self, button: QPushButton) -> None:
+        if bool(button.property("is_history")):
+            self.conversation_list_layout.addWidget(button)
+        else:
+            self.current_conversation_layout.addWidget(button)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        for button in self._conversation_buttons:
+            self._sync_conversation_button_text(button, button.toolTip() or button.text())
+        self._update_message_widths()
 
     def _describe_operation(self, operation: dict) -> str:
         kind = str(operation.get("kind", "") or "")
@@ -1164,6 +1542,25 @@ class MainWindow(QMainWindow):
         if kind == "command.run":
             return "执行命令 {}".format(args.get("command", ""))
         return str(operation.get("description", kind) or kind)
+
+    def _set_status_message(self, message: str, timed: bool = False) -> None:
+        self._status_base_message = str(message or "")
+        if timed:
+            self._status_started_at = time.monotonic()
+            if not self._status_timer.isActive():
+                self._status_timer.start()
+            self._refresh_status_bar()
+            return
+        self._status_started_at = 0.0
+        self._status_timer.stop()
+        self.status_bar.showMessage(self._status_base_message)
+
+    def _refresh_status_bar(self) -> None:
+        if self._status_started_at <= 0:
+            self.status_bar.showMessage(self._status_base_message)
+            return
+        elapsed = max(0, int(time.monotonic() - self._status_started_at))
+        self.status_bar.showMessage("{} {}s".format(self._status_base_message, elapsed))
 
 
 def launch() -> int:

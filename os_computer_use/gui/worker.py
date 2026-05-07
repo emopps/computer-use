@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
@@ -16,6 +16,7 @@ from os_computer_use.app_runtime import (
 )
 from os_computer_use.agents.intent import TaskClarificationRequired, TaskPlanningError
 from os_computer_use.logging import logger
+from os_computer_use.runtime.task_models import OperationSpec, TaskSpec
 
 
 class TaskCancelledError(RuntimeError):
@@ -159,22 +160,93 @@ class AgentWorker(QObject):
         clarification_rounds = 0
         max_clarification_rounds = 3
         max_decision_retries = 2
+        max_execution_cycles = 20
 
         while True:
             try:
                 if self._cancel_event.is_set():
                     raise TaskCancelledError("\u4efb\u52a1\u5df2\u53d6\u6d88\u3002")
-                logger.log("Planning task...", "cyan")
                 normalized_intent = agents["intent"].normalize(normalized_input)
-                task_spec = agents["decision"].annotate(
-                    agents["planner"].plan(normalized_intent),
-                    memory_agent=agents["memory"],
-                )
                 evaluation = {"satisfied": False, "reason": "not executed"}
-                execution_results = {}
-                for decision_attempt in range(max_decision_retries + 1):
+                executed_steps: List[Dict[str, Any]] = []
+                execution_results: Dict[str, Any] = {}
+                previous_task_spec = None
+                planning_error = None
+                decision_attempt = 0
+                cycle_count = 0
+
+                while True:
                     if self._cancel_event.is_set():
                         raise TaskCancelledError("\u4efb\u52a1\u5df2\u53d6\u6d88\u3002")
+                    if cycle_count >= max_execution_cycles:
+                        raise RuntimeError("达到单步执行上限，任务仍未完成。")
+
+                    logger.log("Planning task...", "cyan")
+                    task_spec = agents["decision"].annotate(
+                        agents["planner"].plan(
+                            normalized_intent,
+                            previous_error=planning_error,
+                            previous_plan=previous_task_spec,
+                            previous_results=executed_steps,
+                        ),
+                        memory_agent=agents["memory"],
+                    )
+                    previous_task_spec = task_spec
+
+                    if task_spec.metadata.get("task_completed"):
+                        evaluation_spec = self._build_evaluation_task_spec(
+                            normalized_intent,
+                            executed_steps,
+                            task_spec.summary,
+                        )
+                        evaluation = agents["decision"].evaluate_result(
+                            instruction=normalized_intent,
+                            task_spec=evaluation_spec,
+                            execution_results={item["eval_id"]: item["output"] for item in executed_steps},
+                        ) if executed_steps else {"satisfied": True, "reason": task_spec.summary}
+
+                        logger.log(
+                            "Decision evaluate: satisfied={}, reason={}".format(
+                                evaluation["satisfied"],
+                                evaluation["reason"],
+                            ),
+                            "green" if evaluation["satisfied"] else "yellow",
+                        )
+                        if evaluation["satisfied"]:
+                            agents["memory"].append_history(
+                                {
+                                    "instruction": normalized_intent,
+                                    "status": "success",
+                                    "reason": evaluation["reason"],
+                                }
+                            )
+                            break
+                        if decision_attempt >= max_decision_retries:
+                            logger.log(
+                                "Decision retry limit reached, task incomplete: {}".format(
+                                    evaluation["reason"]
+                                ),
+                                "red",
+                            )
+                            agents["memory"].append_history(
+                                {
+                                    "instruction": normalized_intent,
+                                    "status": "failed",
+                                    "reason": evaluation["reason"],
+                                }
+                            )
+                            break
+                        decision_attempt += 1
+                        planning_error = evaluation["reason"]
+                        logger.log(
+                            "Decision not satisfied, replanning (attempt {}/{})...".format(
+                                decision_attempt + 1,
+                                max_decision_retries + 1,
+                            ),
+                            "yellow",
+                        )
+                        continue
+
                     execution_results = await agents["planner"].execute_task(
                         instruction=normalized_intent,
                         task_spec=task_spec,
@@ -185,64 +257,23 @@ class AgentWorker(QObject):
                         replan_callback=self._handle_progress,
                         should_cancel=lambda: self._cancel_event.is_set(),
                     )
-
-                    evaluation = agents["decision"].evaluate_result(
-                        instruction=normalized_intent,
-                        task_spec=task_spec,
-                        execution_results=execution_results or {},
-                    )
-
-                    logger.log(
-                        "Decision evaluate: satisfied={}, reason={}".format(
-                            evaluation["satisfied"],
-                            evaluation["reason"],
-                        ),
-                        "green" if evaluation["satisfied"] else "yellow",
-                    )
-
-                    if evaluation["satisfied"]:
-                        agents["memory"].append_history(
+                    cycle_count += 1
+                    planning_error = None
+                    for operation in task_spec.operations:
+                        eval_id = "step_{}_{}".format(cycle_count, operation.id)
+                        executed_steps.append(
                             {
-                                "instruction": normalized_intent,
-                                "status": "success",
-                                "reason": evaluation["reason"],
+                                "eval_id": eval_id,
+                                "operation_id": operation.id,
+                                "kind": operation.kind,
+                                "description": operation.description,
+                                "arguments": dict(operation.arguments),
+                                "output": execution_results.get(operation.id),
                             }
                         )
-                        break
-
-                    if decision_attempt >= max_decision_retries:
-                        logger.log(
-                            "Decision retry limit reached, task incomplete: {}".format(
-                                evaluation["reason"]
-                            ),
-                            "red",
-                        )
-                        agents["memory"].append_history(
-                            {
-                                "instruction": normalized_intent,
-                                "status": "failed",
-                                "reason": evaluation["reason"],
-                            }
-                        )
-                        break
-
-                    logger.log(
-                        "Decision not satisfied, replanning (attempt {}/{})...".format(
-                            decision_attempt + 2,
-                            max_decision_retries + 1,
-                        ),
-                        "yellow",
-                    )
-                    task_spec = agents["decision"].annotate(
-                        agents["planner"].replan(
-                            instruction=normalized_intent,
-                            failed_task_spec=task_spec,
-                            failure_message=evaluation["reason"],
-                        ),
-                        memory_agent=agents["memory"],
-                    )
 
                 agents["memory"].summarize_session(normalized_intent, evaluation)
+                execution_results = {item["eval_id"]: item["output"] for item in executed_steps}
                 return {
                     "instruction": normalized_intent,
                     "evaluation": evaluation,
@@ -274,3 +305,27 @@ class AgentWorker(QObject):
 
             except TaskCancelledError as exc:
                 raise RuntimeError(str(exc))
+
+    @staticmethod
+    def _build_evaluation_task_spec(
+        instruction: str,
+        executed_steps: List[Dict[str, Any]],
+        summary: str,
+    ) -> TaskSpec:
+        operations = [
+            OperationSpec(
+                id=str(item["eval_id"]),
+                kind=str(item.get("kind", "") or "operation"),
+                description=str(item.get("description", "") or item.get("kind", "") or "operation"),
+                arguments=dict(item.get("arguments", {}) or {}),
+                depends_on=[],
+                risky=False,
+            )
+            for item in executed_steps
+        ]
+        return TaskSpec(
+            summary=str(summary or instruction).strip() or instruction,
+            success_criteria=[],
+            operations=operations,
+            metadata={"source": "stepwise_execution"},
+        )

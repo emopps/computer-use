@@ -29,6 +29,7 @@ ENV/
 
 # Runtime outputs
 output/
+history/
 memory/
 screenshots/
 logs/

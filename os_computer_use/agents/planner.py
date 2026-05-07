@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from os_computer_use.agents.action import ActionAgent, TaskExecutionError
@@ -82,7 +83,13 @@ class PlannerAgent:
             ):
                 args["command"] = "xdotool key F5"
 
-    def plan(self, instruction: str, previous_error: Optional[str] = None, previous_plan: Optional[TaskSpec] = None) -> TaskSpec:
+    def plan(
+        self,
+        instruction: str,
+        previous_error: Optional[str] = None,
+        previous_plan: Optional[TaskSpec] = None,
+        previous_results: Optional[Any] = None,
+    ) -> TaskSpec:
         if self.provider is None:
             raise TaskPlanningError("PlannerAgent requires a configured language model provider.")
 
@@ -92,6 +99,7 @@ class PlannerAgent:
                 instruction,
                 previous_error=planning_errors[-1] if planning_errors else previous_error,
                 previous_plan=self._task_spec_to_dict(previous_plan) if previous_plan else None,
+                previous_results=previous_results,
             )
             response = self.provider.call([{"role": "user", "content": prompt}])
             logger.log(
@@ -99,7 +107,11 @@ class PlannerAgent:
                 "gray",
             )
             try:
-                return self._parse_and_normalize_plan(instruction, response)
+                return self._parse_and_normalize_plan(
+                    instruction,
+                    response,
+                    previous_results=previous_results,
+                )
             except TaskClarificationRequired:
                 raise
             except TaskPlanningError as exc:
@@ -111,12 +123,19 @@ class PlannerAgent:
             )
         )
 
-    def replan(self, instruction: str, failed_task_spec: TaskSpec, failure_message: str) -> TaskSpec:
+    def replan(
+        self,
+        instruction: str,
+        failed_task_spec: TaskSpec,
+        failure_message: str,
+        previous_results: Optional[Any] = None,
+    ) -> TaskSpec:
         """重新规划：基于失败的 task_spec 和失败原因，重新生成计划。"""
         return self.plan(
             instruction=instruction,
             previous_error=failure_message,
             previous_plan=failed_task_spec,
+            previous_results=previous_results,
         )
 
     def _build_planning_prompt(
@@ -124,11 +143,12 @@ class PlannerAgent:
         instruction: str,
         previous_error: Optional[str],
         previous_plan: Optional[Dict[str, Any]],
+        previous_results: Optional[Any],
     ) -> str:
         from os_computer_use.runtime.capabilities import supported_kinds_text
         blocks = [
             "You are the Planner Agent for a desktop computer-use system.\n",
-            "Convert the user instruction into a valid JSON task plan (DAG).\n",
+            "Convert the user instruction into the next valid JSON task step for a desktop automation loop.\n",
             "Return JSON only. No markdown. No prose.\n",
             "Use only supported operation kinds: {}\n".format(supported_kinds_text()),
             "Required schema:\n",
@@ -148,6 +168,9 @@ class PlannerAgent:
             "  ]\n",
             "}\n",
             "Rules:\n",
+            "0. 这是单步循环模式。每次只规划当前最应该执行的一个原子步骤。除非任务已经完成，否则 operations 里只保留一个当前可执行步骤。\n",
+            "0a. 如果结合已完成结果判断任务已经完成，返回空 operations，并在 metadata 中设置 {\"task_completed\": true}。\n",
+            "0b. 已经成功执行过的步骤不要再次规划。尤其是 spreadsheet.open / browser.open / filesystem.open_path 这类打开动作，完成后下一步应该前进到写入、搜索、复制结果等后续动作。\n",
             "1. 不要输出不支持的操作类型。\n",
             "2. 使用 arguments，不是 params。\n",
             "3. 使用 depends_on，不是 dependencies。\n",
@@ -171,6 +194,10 @@ class PlannerAgent:
             blocks.append("Previous plan:\n")
             blocks.append(json.dumps(previous_plan, ensure_ascii=False))
             blocks.append("\n")
+        if previous_results:
+            blocks.append("Completed execution results so far:\n")
+            blocks.append(self._results_for_prompt(previous_results))
+            blocks.append("\n")
         if previous_error:
             blocks.append("Previous error:\n")
             blocks.append(previous_error)
@@ -178,6 +205,26 @@ class PlannerAgent:
         blocks.append("User instruction:\n")
         blocks.append(instruction)
         return "".join(blocks)
+
+    @staticmethod
+    def _results_for_prompt(previous_results: Any) -> str:
+        if isinstance(previous_results, list):
+            lines = []
+            for item in previous_results[-12:]:
+                if not isinstance(item, dict):
+                    lines.append(str(item))
+                    continue
+                lines.append(
+                    "- {kind}({operation_id}): {output}".format(
+                        kind=str(item.get("kind", "") or "operation"),
+                        operation_id=str(item.get("operation_id", "") or "step"),
+                        output=PlannerAgent._short_output(item.get("output")),
+                    )
+                )
+            return "\n".join(lines)
+        if isinstance(previous_results, dict):
+            return json.dumps(PlannerAgent._safe_output(previous_results), ensure_ascii=False)
+        return str(previous_results)
 
     # 安全网：必填参数，不允许模型编造
     _REQUIRED_PARAMS = {
@@ -225,6 +272,10 @@ class PlannerAgent:
                     if any(p in value for p in placeholder_patterns):
                         raise TaskClarificationRequired(
                             "模型生成了占位符文本 '{}'，请使用 from_operation 引用前序操作结果，或提供实际内容。".format(value)
+                        )
+                    if re.match(r"^@[A-Za-z0-9_\-]+\.(?:text|output)$", value.strip()):
+                        raise TaskClarificationRequired(
+                            "模型生成了未解析的引用文本 '{}'，请改用 from_operation 引用前序操作结果。".format(value)
                         )
                 if value is None or (isinstance(value, str) and not value.strip()):
                     # 缺少必填参数——模型跳过了
@@ -291,7 +342,12 @@ class PlannerAgent:
                                 "你想把文件重命名为什么名字？"
                             )
 
-    def _parse_and_normalize_plan(self, instruction: str, raw_response: str) -> TaskSpec:
+    def _parse_and_normalize_plan(
+        self,
+        instruction: str,
+        raw_response: str,
+        previous_results: Optional[Any] = None,
+    ) -> TaskSpec:
         parsed = self._extract_json_value(raw_response)
         
         # 确保操作存在且为列表
@@ -301,6 +357,7 @@ class PlannerAgent:
         ops = parsed.get("operations", [])
         if not isinstance(ops, list):
             raise TaskPlanningError("'operations' must be a list.")
+        parsed.setdefault("metadata", {})
             
         # 基本参数映射修正
         for op in ops:
@@ -309,6 +366,7 @@ class PlannerAgent:
             if not isinstance(args, dict):
                 op["arguments"] = {}
                 args = op["arguments"]
+            self._normalize_reference_arguments(args)
                 
             # 重命名修正：new_name 应为文件名，src 应为完整路径
             if kind == "filesystem.rename":
@@ -323,32 +381,7 @@ class PlannerAgent:
                 if isinstance(val, str) and val.startswith("file://"):
                     args[path_key] = re.sub(r'^file://+', '', val)
 
-            # 自动修正：from_operation:xxx 作为 text 字面值 → 正确的 from_operation 参数
             text_val = args.get("text", "")
-            if isinstance(text_val, dict):
-                source_id = text_val.get("from_operation") or text_val.get("source_operation")
-                if source_id:
-                    args["from_operation"] = str(source_id)
-                    del args["text"]
-                    text_val = ""
-            if isinstance(text_val, str):
-                # 匹配 "from_operation:xxx" 或 "from_operation: xxx"（无方括号）
-                from_op_match = re.match(r'^from_operation[:\s]+(\w+)$', text_val.strip())
-                if from_op_match:
-                    args["from_operation"] = from_op_match.group(1)
-                    del args["text"]
-                else:
-                    stripped_text = text_val.strip()
-                    if stripped_text.startswith("{") and stripped_text.endswith("}"):
-                        try:
-                            parsed_text = json.loads(stripped_text)
-                        except Exception:
-                            parsed_text = None
-                        if isinstance(parsed_text, dict):
-                            source_id = parsed_text.get("from_operation") or parsed_text.get("source_operation")
-                            if source_id:
-                                args["from_operation"] = str(source_id)
-                                del args["text"]
 
             # 自动修正：browser.open 带搜索URL → browser.search
             # LLM 有时生成 browser.open + google.com/search?q=... 而非 browser.search
@@ -406,7 +439,26 @@ class PlannerAgent:
         # 结构保证：spreadsheet.write_cell 之前必须有 spreadsheet.open
         ops = self._ensure_spreadsheet_open_before_write(ops, parsed)
         ops = self._ensure_from_operation_dependencies(ops)
+        ops = self._resolve_completed_external_dependencies(ops, previous_results)
         ops = self._serialize_spreadsheet_writes(ops)
+        ops = self._prune_completed_operation_dicts(ops, previous_results)
+        ops = self._reduce_to_next_step(ops)
+        parsed["operations"] = ops
+        summary = str(parsed.get("summary", "") or "").strip()
+        if not summary:
+            if parsed["operations"]:
+                first_op = parsed["operations"][0]
+                summary = str(first_op.get("description", "") or first_op.get("kind", "") or "").strip()
+            elif previous_results:
+                summary = "Task completed."
+            else:
+                summary = str(instruction or "").strip()
+            parsed["summary"] = summary
+        if not parsed["operations"]:
+            parsed.setdefault("metadata", {})
+            parsed["metadata"]["task_completed"] = True
+            if not str(parsed.get("summary", "") or "").strip():
+                parsed["summary"] = "Task completed."
 
         try:
             spec = TaskSpec.from_dict(parsed)
@@ -416,6 +468,244 @@ class PlannerAgent:
         # 安全网：验证必填参数未被编造
         self._validate_plan_params(instruction, spec)
         return spec
+
+    @staticmethod
+    def _normalize_reference_arguments(args: Dict[str, Any]) -> None:
+        text_val = args.get("text", "")
+        if isinstance(text_val, dict):
+            source_id = text_val.get("from_operation") or text_val.get("source_operation")
+            if source_id:
+                args["from_operation"] = str(source_id)
+                args.pop("text", None)
+                return
+
+        if not isinstance(text_val, str):
+            return
+
+        stripped_text = text_val.strip()
+        if not stripped_text:
+            return
+
+        matchers = [
+            re.match(r'^from_operation[:\s]+([A-Za-z0-9_\-]+)$', stripped_text),
+            re.match(r'^\[from_operation[:\s]+([A-Za-z0-9_\-]+)\]$', stripped_text),
+            re.match(r'^@([A-Za-z0-9_\-]+)\.(?:text|output)$', stripped_text),
+        ]
+        for matched in matchers:
+            if matched:
+                args["from_operation"] = matched.group(1)
+                args.pop("text", None)
+                return
+
+        if stripped_text.startswith("{") and stripped_text.endswith("}"):
+            try:
+                parsed_text = json.loads(stripped_text)
+            except Exception:
+                parsed_text = None
+            if isinstance(parsed_text, dict):
+                source_id = parsed_text.get("from_operation") or parsed_text.get("source_operation")
+                if source_id:
+                    args["from_operation"] = str(source_id)
+                    args.pop("text", None)
+
+    def _resolve_completed_external_dependencies(self, ops: list, previous_results: Optional[Any]) -> list:
+        if not ops or not isinstance(previous_results, list):
+            return ops
+
+        completed_by_operation_id = defaultdict(list)
+        for item in previous_results:
+            if not isinstance(item, dict):
+                continue
+            operation_id = str(item.get("operation_id", "") or "")
+            if operation_id:
+                completed_by_operation_id[operation_id].append(item)
+        completed_spreadsheet_targets = {
+            str((item.get("arguments", {}) or {}).get("file_path") or (item.get("arguments", {}) or {}).get("file_name") or "").strip()
+            for item in previous_results
+            if isinstance(item, dict) and str(item.get("kind", "") or "") == "spreadsheet.open"
+        }
+        completed_spreadsheet_targets.discard("")
+        current_ids = {str(op.get("id", "") or "") for op in ops}
+
+        for op in ops:
+            normalized_deps = []
+            for dep in list(op.get("depends_on", []) or []):
+                dep_id = str(dep or "")
+                if not dep_id:
+                    continue
+                if dep_id in current_ids:
+                    normalized_deps.append(dep_id)
+                    continue
+                completed = self._select_previous_result(op, completed_by_operation_id.get(dep_id, []))
+                if completed:
+                    if str(completed.get("kind", "") or "") == "spreadsheet.open":
+                        target_ref = str(
+                            (completed.get("arguments", {}) or {}).get("file_path")
+                            or (completed.get("arguments", {}) or {}).get("file_name")
+                            or ""
+                        ).strip()
+                        if target_ref:
+                            completed_spreadsheet_targets.add(target_ref)
+                    continue
+                normalized_deps.append(dep_id)
+            op["depends_on"] = normalized_deps
+
+            args = op.get("arguments", {}) or {}
+            source_id = str(args.get("from_operation", "") or "").strip()
+            if source_id and source_id not in current_ids:
+                completed = self._select_previous_result(op, completed_by_operation_id.get(source_id, []))
+                if completed:
+                    resolved_text = self._coerce_result_text(completed.get("output"))
+                    if resolved_text:
+                        args["text"] = resolved_text
+                    args.pop("from_operation", None)
+
+            if op.get("kind") == "spreadsheet.write_cell":
+                target_ref = str(args.get("file_path") or args.get("file_name") or "").strip()
+                if target_ref and target_ref in completed_spreadsheet_targets:
+                    op["depends_on"] = [dep for dep in list(op.get("depends_on", []) or []) if dep in current_ids]
+
+        return ops
+
+    def _reduce_to_next_step(self, ops: list) -> list:
+        if not ops:
+            return ops
+        if len(ops) == 1:
+            return ops
+        op_ids = {str(op.get("id", "")) for op in ops}
+        for op in ops:
+            deps = [str(dep) for dep in op.get("depends_on", []) if str(dep) in op_ids]
+            if not deps:
+                op["depends_on"] = []
+                return [op]
+        first = dict(ops[0])
+        first["depends_on"] = []
+        return [first]
+
+    def _prune_completed_operation_dicts(self, ops: list, previous_results: Optional[Any]) -> list:
+        if not previous_results or not ops:
+            return ops
+        previous_result_items = [item for item in previous_results if isinstance(item, dict)]
+        completed_signatures = {
+            self._operation_signature_from_result(item)
+            for item in previous_result_items
+        }
+        completed_signatures.discard("")
+        if not completed_signatures:
+            return ops
+        completed_results_by_op_id = defaultdict(list)
+        for item in previous_result_items:
+            operation_id = str(item.get("operation_id", "") or "")
+            if operation_id:
+                completed_results_by_op_id[operation_id].append(item)
+        completed_spreadsheet_targets = {
+            str((item.get("arguments", {}) or {}).get("file_path") or (item.get("arguments", {}) or {}).get("file_name") or "").strip()
+            for item in previous_result_items
+            if str(item.get("kind", "") or "") == "spreadsheet.open"
+        }
+        completed_spreadsheet_targets.discard("")
+
+        removed_ids = set()
+        remaining = []
+        for operation in ops:
+            signature = self._operation_signature(
+                str(operation.get("kind", "") or ""),
+                dict(operation.get("arguments", {}) or {}),
+            )
+            if signature in completed_signatures:
+                removed_ids.add(str(operation.get("id", "") or ""))
+                continue
+            remaining.append(operation)
+
+        if not removed_ids:
+            return ops
+
+        for operation in remaining:
+            operation["depends_on"] = [
+                dep for dep in list(operation.get("depends_on", []) or [])
+                if dep not in removed_ids
+            ]
+            args = operation.get("arguments", {})
+            if isinstance(args, dict):
+                source_id = str(args.get("from_operation", "") or "")
+                if source_id in removed_ids:
+                    source_result = self._select_previous_result(operation, completed_results_by_op_id.get(source_id, []))
+                    source_output = source_result.get("output")
+                    resolved_text = self._coerce_result_text(source_output)
+                    if resolved_text:
+                        args["text"] = resolved_text
+                    args.pop("from_operation", None)
+        remaining = self._ensure_spreadsheet_open_before_write(
+            remaining,
+            {"operations": remaining},
+            satisfied_targets=completed_spreadsheet_targets,
+        )
+        remaining = self._ensure_from_operation_dependencies(remaining)
+        remaining = self._serialize_spreadsheet_writes(remaining)
+        return remaining
+
+    @staticmethod
+    def _coerce_result_text(output: Any) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, str):
+            return output.strip()
+        if isinstance(output, dict):
+            candidate = output.get("text")
+            if candidate is not None:
+                return str(candidate).strip()
+        return str(output).strip()
+
+    def _select_previous_result(self, operation: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not candidates:
+            return {}
+        if len(candidates) == 1:
+            return candidates[0]
+
+        operation_context = " ".join(
+            [
+                str(operation.get("id", "") or ""),
+                str(operation.get("description", "") or ""),
+                json.dumps(operation.get("arguments", {}) or {}, ensure_ascii=False),
+            ]
+        ).lower()
+        city_tokens = [
+            "beijing", "北京",
+            "shanghai", "上海",
+            "nanjing", "南京",
+        ]
+
+        best_item = candidates[-1]
+        best_score = -1
+        for index, item in enumerate(candidates):
+            score = index
+            candidate_blob = " ".join(
+                [
+                    str(item.get("description", "") or ""),
+                    json.dumps(item.get("arguments", {}) or {}, ensure_ascii=False),
+                    json.dumps(item.get("output", {}) or {}, ensure_ascii=False),
+                ]
+            ).lower()
+            for token in city_tokens:
+                if token.lower() in operation_context and token.lower() in candidate_blob:
+                    score += 20
+            if str(item.get("kind", "") or "") == "browser.search":
+                score += 3
+            if score > best_score:
+                best_score = score
+                best_item = item
+        return best_item
+
+    @staticmethod
+    def _operation_signature(kind: str, arguments: Dict[str, Any]) -> str:
+        normalized = PlannerAgent._safe_output(dict(arguments or {}))
+        return "{}|{}".format(str(kind or ""), json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+
+    def _operation_signature_from_result(self, item: Dict[str, Any]) -> str:
+        return self._operation_signature(
+            str(item.get("kind", "") or ""),
+            dict(item.get("arguments", {}) or {}),
+        )
 
     def _remove_unnecessary_extract_text(self, ops: list, parsed: dict) -> list:
         """自动清理：移除 browser.search 后不必要的 document.extract_text 中间操作。
@@ -465,9 +755,15 @@ class PlannerAgent:
 
         return ops
 
-    def _ensure_spreadsheet_open_before_write(self, ops: list, parsed: dict) -> list:
+    def _ensure_spreadsheet_open_before_write(
+        self,
+        ops: list,
+        parsed: dict,
+        satisfied_targets: Optional[set] = None,
+    ) -> list:
         """结构保证：每个 spreadsheet.write_cell 必须依赖 spreadsheet.open。
         如果模型忘记包含，自动插入。"""
+        satisfied_targets = satisfied_targets or set()
         existing_ids = {op.get("id", "") for op in ops}
         existing_kinds = {op.get("kind", "") for op in ops}
         has_spreadsheet_open = "spreadsheet.open" in existing_kinds
@@ -490,6 +786,9 @@ class PlannerAgent:
             first_write_args = write_ops[0].get("arguments", {}) or {}
             file_path = first_write_args.get("file_path", "")
             file_name = first_write_args.get("file_name", "")
+            target_ref = str(file_path or file_name or "").strip()
+            if target_ref and target_ref in satisfied_targets:
+                return ops
 
             open_op_id = "open_spreadsheet"
             open_op = {

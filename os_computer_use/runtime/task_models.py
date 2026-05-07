@@ -68,7 +68,8 @@ class TaskSpec:
     def validate(self) -> None:
         if not self.summary:
             raise TaskModelError("Task summary cannot be empty.")
-        if not self.operations:
+        task_completed = bool(self.metadata.get("task_completed", False))
+        if not self.operations and not task_completed:
             raise TaskModelError("Task must include at least one operation.")
 
         seen = set()

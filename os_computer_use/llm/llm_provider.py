@@ -4,6 +4,7 @@ import re
 import base64
 import requests
 import os
+import time
 
 try:
     from llama_cpp import Llama
@@ -250,7 +251,20 @@ class OpenRouterProvider(OpenAIBaseProvider):
         # OpenRouter reasoning specific: extra_body={"reasoning": {"enabled": True}}
         if "extra_body" not in kwargs:
             kwargs["extra_body"] = {"reasoning": {"enabled": True}}
-        return super().completion(messages, **kwargs)
+        last_error = None
+        endpoints = self._candidate_base_urls()
+        for index, base_url in enumerate(endpoints):
+            previous_base_url = self.base_url
+            self.base_url = base_url
+            try:
+                return super().completion(messages, **kwargs)
+            except Exception as exc:
+                last_error = exc
+                if index < len(endpoints) - 1:
+                    time.sleep(1.0 + index)
+            finally:
+                self.base_url = previous_base_url
+        raise last_error or Exception("OpenRouter request failed.")
 
     def transform_message(self, message):
         # Preserve reasoning_details if present
@@ -258,6 +272,23 @@ class OpenRouterProvider(OpenAIBaseProvider):
         if "reasoning_details" in message:
             transformed["reasoning_details"] = message["reasoning_details"]
         return transformed
+
+    def _candidate_base_urls(self):
+        custom = str(os.getenv("OPENROUTER_BASE_URL", "") or "").strip()
+        candidates = []
+        if custom:
+            candidates.append(custom.rstrip("/"))
+        candidates.extend(
+            [
+                "https://openrouter.ai/api/v1",
+                "https://www.openrouter.ai/api/v1",
+            ]
+        )
+        unique = []
+        for item in candidates:
+            if item and item not in unique:
+                unique.append(item)
+        return unique
 
     def call(self, messages, functions=None):
         tools = self.create_function_schema(functions) if functions else None
