@@ -519,6 +519,15 @@ class ActionAgent:
         }
 
     def _normalize_browser_search_output(self, query: str, raw_result: Any) -> Dict[str, Any]:
+        if isinstance(raw_result, dict):
+            normalized = dict(raw_result)
+            normalized.setdefault("query", query)
+            normalized.setdefault("text", str(normalized.get("text", "") or "").strip())
+            normalized.setdefault("raw_text", str(normalized.get("raw_text", normalized.get("text", "")) or "").strip())
+            normalized.setdefault("useful", bool(normalized.get("text")))
+            normalized.setdefault("reason", str(normalized.get("reason", "") or "").strip())
+            return normalized
+
         raw_text = str(raw_result or "").strip()
         filtered_text = raw_text
         useful = bool(raw_text)
@@ -689,11 +698,25 @@ class ActionAgent:
         """从 args['text'] 或 from_operation 前序操作结果获取文本。
         支持 browser.search → filesystem.write_cell / spreadsheet.write_cell 的结果传递。"""
         text = args.get("text")
-        source_op_id = self._extract_from_operation_reference(text) or args.get("from_operation")
+        reference = self._parse_operation_reference(text)
+        source_op_id = reference.get("source_id") or args.get("from_operation")
         if source_op_id and context:
             source_result = context.results.get(source_op_id)
             if source_result and source_result.status == OperationStatus.COMPLETED:
                 output = source_result.output
+                resolved_reference_value = self._resolve_reference_value(
+                    output,
+                    field_path=str(args.get("from_field") or reference.get("field_path") or "").strip(),
+                    list_index=args.get("from_index", reference.get("list_index")),
+                )
+                if resolved_reference_value is not None:
+                    return self._stringify_reference_value(resolved_reference_value)
+                if (args.get("from_field") or reference.get("field_path")) or (
+                    args.get("from_index") is not None or reference.get("list_index") is not None
+                ):
+                    raise TaskExecutionError(
+                        "Referenced result path could not be resolved from '{}'.".format(source_op_id)
+                    )
                 selected_line = self._select_line_for_spreadsheet_target(args, output)
                 if selected_line:
                     return selected_line
@@ -721,9 +744,14 @@ class ActionAgent:
         text = args.get("text")
         if text is None:
             return
-        source_id = self._extract_from_operation_reference(text)
+        reference = self._parse_operation_reference(text)
+        source_id = str(reference.get("source_id", "") or "")
         if source_id:
             args["from_operation"] = source_id
+            if reference.get("field_path"):
+                args["from_field"] = reference.get("field_path")
+            if reference.get("list_index") is not None:
+                args["from_index"] = reference.get("list_index")
             args.pop("text", None)
             return
         if isinstance(text, str):
@@ -760,35 +788,132 @@ class ActionAgent:
 
     @staticmethod
     def _extract_from_operation_reference(value: Any) -> str:
+        parsed = ActionAgent._parse_operation_reference(value)
+        return str(parsed.get("source_id", "") or "")
+
+    @staticmethod
+    def _parse_operation_reference(value: Any) -> Dict[str, Any]:
+        result = {"source_id": "", "field_path": "", "list_index": None}
         if isinstance(value, dict):
             source_id = value.get("from_operation") or value.get("source_operation")
-            return str(source_id).strip() if source_id else ""
+            if source_id:
+                result["source_id"] = str(source_id).strip()
+                result["field_path"] = str(value.get("from_field") or value.get("field_path") or "").strip()
+                index_value = value.get("from_index")
+                if index_value is not None and str(index_value).strip() != "":
+                    try:
+                        result["list_index"] = int(index_value)
+                    except Exception:
+                        result["list_index"] = None
+            return result
 
         if not isinstance(value, str):
-            return ""
+            return result
 
         text = value.strip()
         if not text:
-            return ""
+            return result
 
         plain_match = re.match(r"^\[?from_operation[:\s]+([A-Za-z0-9_\-]+)\]?$", text)
         if plain_match:
-            return plain_match.group(1).strip()
+            result["source_id"] = plain_match.group(1).strip()
+            return result
 
         at_ref_match = re.match(r"^@([A-Za-z0-9_\-]+)\.(?:text|output)$", text)
         if at_ref_match:
-            return at_ref_match.group(1).strip()
+            result["source_id"] = at_ref_match.group(1).strip()
+            return result
+
+        indexed_ref_match = re.match(
+            r"^\$\{\{?\s*([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\-]+)\[(\d+)\]\s*\}?\}$",
+            text,
+        )
+        if indexed_ref_match:
+            result["source_id"] = indexed_ref_match.group(1).strip()
+            result["field_path"] = indexed_ref_match.group(2).strip()
+            result["list_index"] = int(indexed_ref_match.group(3))
+            return result
+
+        field_ref_match = re.match(
+            r"^\$\{\{?\s*([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\-]+)\s*\}?\}$",
+            text,
+        )
+        if field_ref_match:
+            result["source_id"] = field_ref_match.group(1).strip()
+            result["field_path"] = field_ref_match.group(2).strip()
+            return result
+
+        template_ref_match = re.match(
+            r"^\$\{\{\s*([A-Za-z0-9_\-]+)\.(?:text|output)\s*\}\}$",
+            text,
+        )
+        if template_ref_match:
+            result["source_id"] = template_ref_match.group(1).strip()
+            return result
+
+        template_ref_match = re.match(
+            r"^\$\{\s*([A-Za-z0-9_\-]+)\.(?:text|output)\s*\}$",
+            text,
+        )
+        if template_ref_match:
+            result["source_id"] = template_ref_match.group(1).strip()
+            return result
 
         if text.startswith("{") and text.endswith("}"):
             try:
                 parsed = json.loads(text)
             except Exception:
-                return ""
+                return result
             if isinstance(parsed, dict):
                 source_id = parsed.get("from_operation") or parsed.get("source_operation")
-                return str(source_id).strip() if source_id else ""
+                if source_id:
+                    result["source_id"] = str(source_id).strip()
+                    result["field_path"] = str(parsed.get("from_field") or parsed.get("field_path") or "").strip()
+                    index_value = parsed.get("from_index")
+                    if index_value is not None and str(index_value).strip() != "":
+                        try:
+                            result["list_index"] = int(index_value)
+                        except Exception:
+                            result["list_index"] = None
+                return result
 
-        return ""
+        return result
+
+    @staticmethod
+    def _resolve_reference_value(output: Any, field_path: str = "", list_index: Any = None) -> Any:
+        value = output
+        if field_path:
+            if isinstance(value, dict):
+                value = value.get(field_path)
+            else:
+                return None
+        if list_index is not None and str(list_index).strip() != "":
+            try:
+                index = int(list_index)
+            except Exception:
+                return None
+            if isinstance(value, (list, tuple)):
+                if 0 <= index < len(value):
+                    value = value[index]
+                else:
+                    return None
+            else:
+                return None
+        return value
+
+    @staticmethod
+    def _stringify_reference_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)):
+            return "\n".join(str(item) for item in value)
+        if isinstance(value, dict):
+            if "text" in value:
+                return str(value.get("text", "") or "")
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     def _resolve_spreadsheet_path(self, args: Dict[str, Any], *, require_exists: bool = True) -> str:
         file_path = (args.get("file_path") or "").strip()

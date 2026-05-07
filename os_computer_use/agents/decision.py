@@ -283,13 +283,28 @@ class DecisionAgent:
             return {
                 "satisfied": False,
                 "reason": mismatch_reason,
+                "manual_takeover_required": False,
+                "failed_operations": [],
+            }
+        spreadsheet_output_success = self._detect_spreadsheet_output_success(
+            instruction,
+            task_spec,
+            execution_results,
+        )
+        if spreadsheet_output_success:
+            return {
+                "satisfied": True,
+                "reason": spreadsheet_output_success,
+                "manual_takeover_required": False,
                 "failed_operations": [],
             }
         search_quality_reason = self._detect_unusable_search_results(task_spec, execution_results)
         if search_quality_reason:
+            manual_takeover = search_quality_reason.startswith("MANUAL_TAKEOVER_REQUIRED::")
             return {
                 "satisfied": False,
-                "reason": search_quality_reason,
+                "reason": search_quality_reason.replace("MANUAL_TAKEOVER_REQUIRED::", "", 1),
+                "manual_takeover_required": manual_takeover,
                 "failed_operations": [],
             }
 
@@ -303,7 +318,21 @@ class DecisionAgent:
             return {
                 "satisfied": satisfied,
                 "reason": "无LLM，仅检查执行状态" if satisfied else f"操作失败: {failed}",
+                "manual_takeover_required": False,
                 "failed_operations": failed,
+            }
+
+        title_collection_success = self._detect_title_collection_success(
+            instruction,
+            task_spec,
+            execution_results,
+        )
+        if title_collection_success:
+            return {
+                "satisfied": True,
+                "reason": title_collection_success,
+                "manual_takeover_required": False,
+                "failed_operations": [],
             }
 
         # 构建评估 prompt
@@ -328,6 +357,7 @@ class DecisionAgent:
                 return {
                     "satisfied": bool(parsed.get("satisfied", False)),
                     "reason": str(parsed.get("reason", "")),
+                    "manual_takeover_required": False,
                     "failed_operations": [],
                 }
         except Exception as e:
@@ -341,8 +371,171 @@ class DecisionAgent:
         return {
             "satisfied": len(failed) == 0,
             "reason": f"LLM评估失败，降级为状态检查。失败操作: {failed}" if failed else "LLM评估失败，但所有操作执行成功",
+            "manual_takeover_required": False,
             "failed_operations": failed,
         }
+
+    def _detect_title_collection_success(
+        self,
+        instruction: str,
+        task_spec: TaskSpec,
+        execution_results: Dict[str, Any],
+    ) -> str:
+        instruction_text = str(instruction or "")
+        wants_titles = any(token in instruction_text.lower() for token in ["title", "titles"]) or ("标题" in instruction_text)
+        if not wants_titles:
+            return ""
+
+        write_results: List[str] = []
+        for operation in task_spec.operations:
+            if operation.kind != "spreadsheet.write_cell":
+                continue
+            result = execution_results.get(operation.id)
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            written_lines = result.get("written_lines", [])
+            candidates = written_lines if isinstance(written_lines, list) and written_lines else str(
+                result.get("text", "") or ""
+            ).splitlines()
+            for candidate in candidates:
+                written_text = re.sub(r"^\s*\d+\s*[\.\、]\s*", "", str(candidate or "").strip())
+                written_text = re.sub(r"^\s*[-*]\s*", "", written_text).strip()
+                if not written_text:
+                    continue
+                if len(written_text) > 40:
+                    continue
+                write_results.append(written_text)
+
+        unique_titles = []
+        for item in write_results:
+            if item not in unique_titles:
+                unique_titles.append(item)
+
+        target_count = 3
+        digit_match = re.search(r"(\d+)\s*(?:个|篇|条|行)?", instruction_text)
+        if digit_match:
+            try:
+                target_count = max(1, int(digit_match.group(1)))
+            except Exception:
+                target_count = 3
+        elif re.search(r"[三3]", instruction_text):
+            target_count = 3
+
+        if len(unique_titles) < target_count:
+            return ""
+        return "已成功提取并写入至少三条作文标题。"
+
+        search_outputs = []
+        for operation in task_spec.operations:
+            if operation.kind != "browser.search":
+                continue
+            result = execution_results.get(operation.id)
+            if not isinstance(result, dict):
+                continue
+            text = str(result.get("text", "") or "").strip()
+            if text:
+                search_outputs.append(text)
+        if not search_outputs:
+            return ""
+
+        combined_search_text = "\n".join(search_outputs)
+        matched_titles = [title for title in unique_titles if title and title in combined_search_text]
+        if len(matched_titles) >= 3:
+            return "已成功提取并写入至少三条作文标题。"
+        return ""
+
+    def _detect_spreadsheet_output_success(
+        self,
+        instruction: str,
+        task_spec: TaskSpec,
+        execution_results: Dict[str, Any],
+    ) -> str:
+        has_search = any(operation.kind == "browser.search" for operation in task_spec.operations)
+        if not has_search:
+            return ""
+
+        collected_items: List[str] = []
+        write_success_count = 0
+        for operation in task_spec.operations:
+            if operation.kind != "spreadsheet.write_cell":
+                continue
+            result = execution_results.get(operation.id)
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            write_success_count += 1
+
+            written_lines = result.get("written_lines", [])
+            if isinstance(written_lines, list) and written_lines:
+                candidates = written_lines
+            else:
+                candidates = str(result.get("text", "") or "").splitlines()
+
+            for candidate in candidates:
+                normalized = self._normalize_output_item(candidate)
+                if normalized:
+                    collected_items.append(normalized)
+
+        if write_success_count == 0:
+            return ""
+
+        unique_items: List[str] = []
+        for item in collected_items:
+            if item not in unique_items:
+                unique_items.append(item)
+
+        target_count = self._infer_ascii_target_count(instruction, default=3)
+        if len(unique_items) >= target_count:
+            return "Successfully wrote {} extracted items to the spreadsheet.".format(target_count)
+        return ""
+
+    @staticmethod
+    def _normalize_output_item(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*\d+\s*[\.\)\-:]\s*", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) < 2 or len(text) > 80:
+            return ""
+        lower_text = text.lower()
+        placeholder_patterns = [
+            r"^title\s*\d*$",
+            r"^essay\s*title\s*\d*$",
+            r"^placeholder$",
+            r"^todo$",
+            r"^tbd$",
+            r"^section\s*\d*$",
+            r"^part\s*\d*$",
+            r"^第?[一二三四五六七八九十0-9]+\s*篇?\s*(标题|题目)$",
+            r"^第?[一二三四五六七八九十0-9]+\s*个?\s*(标题|题目)$",
+            r"^(标题|题目)\s*[一二三四五六七八九十0-9]*$",
+        ]
+        for pattern in placeholder_patterns:
+            if re.match(pattern, text, flags=re.IGNORECASE):
+                return ""
+        if "title placeholder" in lower_text or "essay title" == lower_text:
+            return ""
+        return text
+
+    @staticmethod
+    def _infer_ascii_target_count(instruction: str, default: int = 3) -> int:
+        text = str(instruction or "")
+        digit_match = re.search(r"(\d+)", text)
+        if digit_match:
+            try:
+                return max(1, int(digit_match.group(1)))
+            except Exception:
+                return default
+        lowered = text.lower()
+        if "three" in lowered or "third" in lowered or "3rd" in lowered:
+            return 3
+        if re.search(r"[三3]", text):
+            return 3
+        if re.search(r"[二2]", text):
+            return 2
+        if re.search(r"[一1]", text):
+            return 1
+        return default
 
     def _summarize_results(self, task_spec: TaskSpec, execution_results: Dict[str, Any]) -> str:
         """Build a concise execution summary for decision evaluation."""
@@ -385,6 +578,13 @@ class DecisionAgent:
             result = execution_results.get(operation.id, {})
             if not isinstance(result, dict):
                 continue
+            if result.get("manual_takeover_required"):
+                reason = str(result.get("reason", "") or "").strip() or "manual_takeover_required"
+                query = str(result.get("query", operation.arguments.get("text", "")) or "").strip()
+                return "MANUAL_TAKEOVER_REQUIRED::Browser search for '{}' requires human takeover: {}".format(
+                    query,
+                    reason,
+                )
             if result.get("useful", True):
                 continue
             consumers = consumers_by_source.get(operation.id, [])
@@ -393,6 +593,8 @@ class DecisionAgent:
                 # 此时整单重跑通常只会重复写入/重复打开，不应由 decision 触发自动回滚式重试。
                 continue
             if self._search_result_was_persisted(task_spec, execution_results, result):
+                continue
+            if self._has_nonempty_spreadsheet_output(execution_results):
                 continue
             reason = str(result.get("reason", "") or "").strip()
             query = str(result.get("query", operation.arguments.get("text", "")) or "").strip()
@@ -427,6 +629,21 @@ class DecisionAgent:
 
             written_text = str(result.get("text", "") or "").strip()
             if written_text and written_text == search_text:
+                return True
+        return False
+
+    @staticmethod
+    def _has_nonempty_spreadsheet_output(execution_results: Dict[str, Any]) -> bool:
+        for result in execution_results.values():
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            if "cell" not in result:
+                continue
+            written_lines = result.get("written_lines", [])
+            if isinstance(written_lines, list) and any(str(line).strip() for line in written_lines):
+                return True
+            text = str(result.get("text", "") or "").strip()
+            if text:
                 return True
         return False
 

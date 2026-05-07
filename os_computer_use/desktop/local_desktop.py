@@ -4,6 +4,8 @@ from PIL import Image
 import os
 import re
 import time
+import random
+import json
 import subprocess
 import shutil
 import asyncio
@@ -11,6 +13,7 @@ import shlex
 import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
+from urllib import parse, request
 from typing import List, Optional
 
 class LocalDesktop:
@@ -25,6 +28,16 @@ class LocalDesktop:
         self._browser_pages = {}
         self._browser_lock = None
         self._wps_window_id = None  # 记住当前操作的WPS窗口，避免多窗口冲突
+        self.progress_callback = None
+
+    def _emit_progress(self, event: str, **payload) -> None:
+        callback = getattr(self, "progress_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback({"event": event, **payload})
+        except Exception:
+            return
 
     def write_text_file(self, file_path, content, encoding="utf-8"):
         file_path = os.path.expanduser(file_path)
@@ -323,14 +336,20 @@ class LocalDesktop:
         async with lock:
             return await self._get_browser_page(page_key=page_key, create=create)
 
+    async def _browser_action_sleep(self, minimum: float = 1.0, maximum: float = 2.0) -> None:
+        lower = max(0.0, float(minimum))
+        upper = max(lower, float(maximum))
+        await asyncio.sleep(random.uniform(lower, upper))
+
     async def open_browser(self, url="https://www.baidu.com", page_key=None):
         lock = self._ensure_browser_lock()
         async with lock:
             page = await self._get_browser_page(page_key=page_key, create=True)
+            await self._browser_action_sleep()
             await page.goto(url, wait_until="networkidle")
             self._page = page
         # 将浏览器窗口激活到前台，让用户可见
-        await asyncio.sleep(1)
+        await self._browser_action_sleep()
         self._activate_browser_window()
         return page
 
@@ -366,7 +385,21 @@ class LocalDesktop:
                 current_url = str(page.url or "")
             except Exception:
                 current_url = ""
+            api_result = self._try_api_priority_search(query)
+            if api_result:
+                await self._browser_action_sleep()
+                search_url = "https://www.baidu.com/s?wd={}".format(parse.quote(query))
+                await page.goto(search_url, wait_until="domcontentloaded")
+                self._page = page
+                return {
+                    "query": query,
+                    "text": api_result,
+                    "source": "api_priority",
+                    "useful": True,
+                    "reason": "api_priority_answer",
+                }
             if "baidu.com" not in current_url or "/s?" in current_url:
+                await self._browser_action_sleep()
                 await page.goto("https://www.baidu.com", wait_until="networkidle")
             self._page = page
             primary_result = await self._run_browser_search_query(query)
@@ -382,10 +415,260 @@ class LocalDesktop:
         if input_box is None:
             raise RuntimeError("browser_search requires text.")
         await self._set_browser_search_input(input_box, query)
-        await asyncio.sleep(0.35)
+        await self._browser_action_sleep()
         await self._submit_browser_search()
-        await asyncio.sleep(2.2)
+        await self._browser_action_sleep()
+        verification_result = await self._wait_for_manual_verification_clear(query)
+        if verification_result:
+            return verification_result
         return await self._extract_search_results(query)
+
+    def _try_api_priority_search(self, query: str) -> str:
+        if self._is_weather_query(query):
+            return self._weather_api_answer(query)
+        return ""
+
+    def _weather_api_answer(self, query: str) -> str:
+        location = str(query or "").replace("天气", "").replace("气温", "").strip(" ，,。")
+        if not location:
+            return ""
+        try:
+            geo_url = (
+                "https://geocoding-api.open-meteo.com/v1/search?"
+                + parse.urlencode(
+                    {
+                        "name": location,
+                        "count": 1,
+                        "language": "zh",
+                        "format": "json",
+                    }
+                )
+            )
+            geo_payload = self._fetch_json(geo_url, timeout=8.0)
+            results = geo_payload.get("results") if isinstance(geo_payload, dict) else None
+            if not isinstance(results, list) or not results:
+                return ""
+            first = results[0] or {}
+            latitude = first.get("latitude")
+            longitude = first.get("longitude")
+            resolved_name = str(first.get("name") or location).strip() or location
+            admin1 = str(first.get("admin1") or "").strip()
+            country = str(first.get("country") or "").strip()
+            if latitude is None or longitude is None:
+                return ""
+
+            weather_url = (
+                "https://api.open-meteo.com/v1/forecast?"
+                + parse.urlencode(
+                    {
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "current": "temperature_2m,weather_code,wind_speed_10m",
+                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "forecast_days": 1,
+                        "timezone": "auto",
+                    }
+                )
+            )
+            weather_payload = self._fetch_json(weather_url, timeout=8.0)
+            if not isinstance(weather_payload, dict):
+                return ""
+            current = weather_payload.get("current") or {}
+            daily = weather_payload.get("daily") or {}
+            current_temp = current.get("temperature_2m")
+            weather_code = current.get("weather_code")
+            wind_speed = current.get("wind_speed_10m")
+            max_list = daily.get("temperature_2m_max") or []
+            min_list = daily.get("temperature_2m_min") or []
+            high = max_list[0] if isinstance(max_list, list) and max_list else None
+            low = min_list[0] if isinstance(min_list, list) and min_list else None
+            condition = self._map_open_meteo_weather_code(weather_code)
+
+            parts = []
+            place_parts = [part for part in [resolved_name, admin1, country] if part]
+            if place_parts:
+                parts.append(" / ".join(place_parts[:2]))
+            summary = []
+            if condition:
+                summary.append(condition)
+            if current_temp is not None:
+                summary.append("{}℃".format(self._format_number(current_temp)))
+            if high is not None and low is not None:
+                summary.append("{}~{}℃".format(self._format_number(low), self._format_number(high)))
+            if wind_speed is not None:
+                summary.append("风速{}km/h".format(self._format_number(wind_speed)))
+            if summary:
+                parts.append("，".join(summary))
+            return "：".join(parts) if len(parts) >= 2 else (parts[0] if parts else "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _fetch_json(url: str, timeout: float = 8.0) -> dict:
+        with request.urlopen(url, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+        parsed = json.loads(payload)
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _format_number(value) -> str:
+        try:
+            number = float(value)
+        except Exception:
+            return str(value)
+        if number.is_integer():
+            return str(int(number))
+        return "{:.1f}".format(number)
+
+    @staticmethod
+    def _map_open_meteo_weather_code(code) -> str:
+        mapping = {
+            0: "晴",
+            1: "晴间多云",
+            2: "多云",
+            3: "阴",
+            45: "雾",
+            48: "雾",
+            51: "小毛雨",
+            53: "毛雨",
+            55: "大毛雨",
+            56: "冻毛雨",
+            57: "冻毛雨",
+            61: "小雨",
+            63: "中雨",
+            65: "大雨",
+            66: "冻雨",
+            67: "冻雨",
+            71: "小雪",
+            73: "中雪",
+            75: "大雪",
+            77: "雪粒",
+            80: "阵雨",
+            81: "阵雨",
+            82: "暴雨",
+            85: "阵雪",
+            86: "大阵雪",
+            95: "雷阵雨",
+            96: "雷暴夹冰雹",
+            99: "强雷暴夹冰雹",
+        }
+        try:
+            return mapping.get(int(code), "")
+        except Exception:
+            return ""
+
+    async def _capture_search_page_snapshot(self):
+        if not self._page:
+            return None
+        try:
+            return await self._page.evaluate(
+                """() => ({
+                    url: String(window.location.href || ''),
+                    title: String(document.title || ''),
+                    text: String(document.body?.innerText || '').slice(0, 4000)
+                })"""
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_search_verification_snapshot(snapshot) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        current_url = str(snapshot.get("url", "") or "")
+        current_title = str(snapshot.get("title", "") or "")
+        blob = " ".join(
+            [
+                current_url,
+                current_title,
+                str(snapshot.get("text", "") or ""),
+            ]
+        )
+        lower_url = current_url.lower()
+        verification_domains = [
+            "wappass.baidu.com",
+            "passport.baidu.com",
+        ]
+        verification_paths = [
+            "/static/captcha/",
+            "/cgi-bin/genimage",
+            "/nocaptcha/",
+            "captcha",
+            "verify",
+        ]
+        if any(domain in lower_url for domain in verification_domains):
+            return True
+        if any(token in lower_url for token in verification_paths):
+            return True
+        tokens = [
+            "安全验证",
+            "验证码",
+            "请输入验证码",
+            "异常流量",
+            "访问受限",
+            "robot",
+            "captcha",
+            "verify",
+            "请完成下列验证",
+            "请完成安全验证",
+        ]
+        return any(token.lower() in blob.lower() for token in tokens)
+
+    async def _wait_for_manual_verification_clear(self, query: str):
+        snapshot = await self._capture_search_page_snapshot()
+        if not self._is_search_verification_snapshot(snapshot):
+            return None
+
+        print("[OCU] 搜索触发验证，请人工完成验证，完成后将自动继续。")
+        self._emit_progress(
+            "task",
+            status="waiting_manual_verification",
+            summary="检测到搜索验证，请在浏览器中手动完成验证，系统将自动继续。",
+        )
+        deadline = time.time() + 300.0
+        while time.time() < deadline:
+            await asyncio.sleep(1.0)
+            snapshot = await self._capture_search_page_snapshot()
+            if not self._is_search_verification_snapshot(snapshot):
+                self._emit_progress(
+                    "task",
+                    status="manual_verification_cleared",
+                    summary="验证已通过，正在继续执行搜索任务。",
+                )
+                await self._browser_action_sleep()
+                return None
+
+        current_url = str((snapshot or {}).get("url", "") or "")
+        current_title = str((snapshot or {}).get("title", "") or "")
+        return {
+            "query": query,
+            "text": "搜索触发验证，请人工完成验证后重试。",
+            "source": "browser_verification",
+            "useful": False,
+            "reason": "search_verification_required",
+            "manual_takeover_required": True,
+            "verification_url": current_url,
+            "verification_title": current_title,
+        }
+
+    async def _detect_search_verification_state(self, query: str):
+        snapshot = await self._capture_search_page_snapshot()
+        if not isinstance(snapshot, dict):
+            return None
+        if self._is_search_verification_snapshot(snapshot):
+            current_url = str(snapshot.get("url", "") or "")
+            current_title = str(snapshot.get("title", "") or "")
+            return {
+                "query": query,
+                "text": "搜索触发验证，请人工完成验证后继续。",
+                "source": "browser_verification",
+                "useful": False,
+                "reason": "search_verification_required",
+                "manual_takeover_required": True,
+                "verification_url": current_url,
+                "verification_title": current_title,
+            }
+        return None
 
     def _should_retry_weather_query(self, result_text: str, original_query: str) -> bool:
         if not self._is_weather_query(original_query):
@@ -426,9 +709,11 @@ class LocalDesktop:
         return None
 
     async def _set_browser_search_input(self, element, text: str) -> None:
+        await self._browser_action_sleep()
         await element.click()
-        await asyncio.sleep(0.1)
+        await self._browser_action_sleep()
         await self._clear_browser_search_input(element)
+        await self._browser_action_sleep()
         try:
             await element.fill(text)
         except Exception:
@@ -511,11 +796,12 @@ class LocalDesktop:
         except Exception:
             pass
         try:
+            await self._browser_action_sleep()
             await element.click()
             await self._page.keyboard.press("Control+A")
-            await asyncio.sleep(0.05)
+            await self._browser_action_sleep()
             await self._page.keyboard.press("Backspace")
-            await asyncio.sleep(0.05)
+            await self._browser_action_sleep()
             await self._page.keyboard.press("Delete")
         except Exception:
             pass
@@ -555,10 +841,12 @@ class LocalDesktop:
             try:
                 button = self._page.locator(selector).first
                 if await button.count() > 0 and await button.is_visible(timeout=1200):
+                    await self._browser_action_sleep()
                     await button.click(timeout=2500, force=True)
                     return
             except Exception:
                 continue
+        await self._browser_action_sleep()
         await self._page.keyboard.press("Enter")
 
     async def _extract_search_results(self, query: str) -> str:

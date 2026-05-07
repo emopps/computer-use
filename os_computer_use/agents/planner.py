@@ -171,6 +171,7 @@ class PlannerAgent:
             "0. 这是单步循环模式。每次只规划当前最应该执行的一个原子步骤。除非任务已经完成，否则 operations 里只保留一个当前可执行步骤。\n",
             "0a. 如果结合已完成结果判断任务已经完成，返回空 operations，并在 metadata 中设置 {\"task_completed\": true}。\n",
             "0b. 已经成功执行过的步骤不要再次规划。尤其是 spreadsheet.open / browser.open / filesystem.open_path 这类打开动作，完成后下一步应该前进到写入、搜索、复制结果等后续动作。\n",
+            "0c. 如果用户要求把搜索结果写入表格/单元格/Excel/WPS，在真正出现成功的 spreadsheet.write_cell 之前，绝不能返回 task_completed。仅完成 browser.search 仍然未完成任务。\n",
             "1. 不要输出不支持的操作类型。\n",
             "2. 使用 arguments，不是 params。\n",
             "3. 使用 depends_on，不是 dependencies。\n",
@@ -273,7 +274,13 @@ class PlannerAgent:
                         raise TaskClarificationRequired(
                             "模型生成了占位符文本 '{}'，请使用 from_operation 引用前序操作结果，或提供实际内容。".format(value)
                         )
-                    if re.match(r"^@[A-Za-z0-9_\-]+\.(?:text|output)$", value.strip()):
+                    if re.match(r"^@[A-Za-z0-9_\-]+\.(?:text|output)$", value.strip()) or re.match(
+                        r"^\$\{\{?\s*[A-Za-z0-9_\-]+\.(?:text|output)\s*\}?\}$",
+                        value.strip(),
+                    ) or re.match(
+                        r"^\$\{\{?\s*[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+(?:\[\d+\])?\s*\}?\}$",
+                        value.strip(),
+                    ):
                         raise TaskClarificationRequired(
                             "模型生成了未解析的引用文本 '{}'，请改用 from_operation 引用前序操作结果。".format(value)
                         )
@@ -476,6 +483,15 @@ class PlannerAgent:
             source_id = text_val.get("from_operation") or text_val.get("source_operation")
             if source_id:
                 args["from_operation"] = str(source_id)
+                field_path = text_val.get("from_field") or text_val.get("field_path")
+                if field_path:
+                    args["from_field"] = str(field_path).strip()
+                index_value = text_val.get("from_index")
+                if index_value is not None and str(index_value).strip() != "":
+                    try:
+                        args["from_index"] = int(index_value)
+                    except Exception:
+                        pass
                 args.pop("text", None)
                 return
 
@@ -490,12 +506,35 @@ class PlannerAgent:
             re.match(r'^from_operation[:\s]+([A-Za-z0-9_\-]+)$', stripped_text),
             re.match(r'^\[from_operation[:\s]+([A-Za-z0-9_\-]+)\]$', stripped_text),
             re.match(r'^@([A-Za-z0-9_\-]+)\.(?:text|output)$', stripped_text),
+            re.match(r'^\$\{\{\s*([A-Za-z0-9_\-]+)\.(?:text|output)\s*\}\}$', stripped_text),
+            re.match(r'^\$\{\s*([A-Za-z0-9_\-]+)\.(?:text|output)\s*\}$', stripped_text),
         ]
         for matched in matchers:
             if matched:
                 args["from_operation"] = matched.group(1)
                 args.pop("text", None)
                 return
+
+        indexed_match = re.match(
+            r'^\$\{\{?\s*([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\-]+)\[(\d+)\]\s*\}?\}$',
+            stripped_text,
+        )
+        if indexed_match:
+            args["from_operation"] = indexed_match.group(1)
+            args["from_field"] = indexed_match.group(2)
+            args["from_index"] = int(indexed_match.group(3))
+            args.pop("text", None)
+            return
+
+        field_match = re.match(
+            r'^\$\{\{?\s*([A-Za-z0-9_\-]+)\.([A-Za-z0-9_\-]+)\s*\}?\}$',
+            stripped_text,
+        )
+        if field_match:
+            args["from_operation"] = field_match.group(1)
+            args["from_field"] = field_match.group(2)
+            args.pop("text", None)
+            return
 
         if stripped_text.startswith("{") and stripped_text.endswith("}"):
             try:
@@ -506,6 +545,15 @@ class PlannerAgent:
                 source_id = parsed_text.get("from_operation") or parsed_text.get("source_operation")
                 if source_id:
                     args["from_operation"] = str(source_id)
+                    field_path = parsed_text.get("from_field") or parsed_text.get("field_path")
+                    if field_path:
+                        args["from_field"] = str(field_path).strip()
+                    index_value = parsed_text.get("from_index")
+                    if index_value is not None and str(index_value).strip() != "":
+                        try:
+                            args["from_index"] = int(index_value)
+                        except Exception:
+                            pass
                     args.pop("text", None)
 
     def _resolve_completed_external_dependencies(self, ops: list, previous_results: Optional[Any]) -> list:

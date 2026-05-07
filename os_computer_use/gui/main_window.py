@@ -277,6 +277,7 @@ class OperationStatusRow(QFrame):
         super().__init__()
         self.setObjectName("operationRow")
         self._running_since = 0.0
+        self._last_elapsed = 0
         self._timer = QTimer(self)
         self._timer.setInterval(250)
         self._timer.timeout.connect(self._tick)
@@ -303,27 +304,31 @@ class OperationStatusRow(QFrame):
     def _tick(self) -> None:
         if self._running_since <= 0:
             return
-        elapsed = max(0, int(time.monotonic() - self._running_since))
-        self.status_label.setText("Running {}s".format(elapsed))
+        self._last_elapsed = max(0, int(time.monotonic() - self._running_since))
+        self.status_label.setText("Running {}s".format(self._last_elapsed))
 
     def set_status(self, status: str) -> None:
         if status == "running":
             if self._running_since <= 0:
                 self._running_since = time.monotonic()
+                self._last_elapsed = 0
             if not self._timer.isActive():
                 self._timer.start()
             self.status_label.setText("Running 0s")
             self.setProperty("state", "running")
         elif status == "completed":
-            elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else 0
+            elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else self._last_elapsed
+            self._last_elapsed = elapsed
             self._timer.stop()
             self._running_since = 0.0
-            self.status_label.setText("Finished {}s".format(elapsed) if elapsed else "Finished")
+            self.status_label.setText("Finished {}s".format(elapsed))
             self.setProperty("state", "completed")
         else:
             self._timer.stop()
+            elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else self._last_elapsed
+            self._last_elapsed = elapsed
             self._running_since = 0.0
-            self.status_label.setText("Failed")
+            self.status_label.setText("Failed {}s".format(elapsed) if elapsed else "Failed")
             self.setProperty("state", "failed")
         self.style().unpolish(self)
         self.style().polish(self)
@@ -1168,7 +1173,19 @@ class MainWindow(QMainWindow):
         return mapping.get(str(kind or ""), str(kind or "执行步骤"))
 
     def _show_status(self, message: str) -> None:
-        self._set_status_message(message)
+        localized = self._localize_runtime_text(message)
+        verification_markers = [
+            "检测到搜索验证",
+            "请在浏览器中手动完成验证",
+            "验证已通过，正在继续执行搜索任务",
+        ]
+        if any(marker in localized for marker in verification_markers):
+            card = self._ensure_assistant_card()
+            card.append_text(localized, "yellow")
+            if self._active_conversation_button is not None:
+                self._save_current_conversation_state(self._active_conversation_button)
+            self._scroll_bottom()
+        self._set_status_message(message, timed=self._running)
 
     def _ask_clarification(self, question: str) -> None:
         self._awaiting_clarification = True
@@ -1546,7 +1563,8 @@ class MainWindow(QMainWindow):
     def _set_status_message(self, message: str, timed: bool = False) -> None:
         self._status_base_message = str(message or "")
         if timed:
-            self._status_started_at = time.monotonic()
+            if self._status_started_at <= 0:
+                self._status_started_at = time.monotonic()
             if not self._status_timer.isActive():
                 self._status_timer.start()
             self._refresh_status_bar()

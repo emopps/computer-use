@@ -155,6 +155,10 @@ class AgentWorker(QObject):
         output_dir, memory_dir, session_memory_dir = initialize_run_directories()
         agents = await build_agent(output_dir, memory_dir, session_memory_dir)
         agents["audit"].authorization_callback = self._request_authorization
+        try:
+            agents["action"].desktop.progress_callback = self._handle_progress
+        except Exception:
+            pass
 
         normalized_input = prompt.strip()
         clarification_rounds = 0
@@ -194,6 +198,17 @@ class AgentWorker(QObject):
                     previous_task_spec = task_spec
 
                     if task_spec.metadata.get("task_completed"):
+                        unmet_side_effect_reason = self._detect_unmet_required_side_effect(
+                            normalized_intent,
+                            executed_steps,
+                        )
+                        if unmet_side_effect_reason:
+                            planning_error = unmet_side_effect_reason
+                            logger.log(
+                                "Task completion rejected: {}".format(unmet_side_effect_reason),
+                                "yellow",
+                            )
+                            continue
                         evaluation_spec = self._build_evaluation_task_spec(
                             normalized_intent,
                             executed_steps,
@@ -217,6 +232,19 @@ class AgentWorker(QObject):
                                 {
                                     "instruction": normalized_intent,
                                     "status": "success",
+                                    "reason": evaluation["reason"],
+                                }
+                            )
+                            break
+                        if evaluation.get("manual_takeover_required"):
+                            logger.log(
+                                "Manual takeover required: {}".format(evaluation["reason"]),
+                                "yellow",
+                            )
+                            agents["memory"].append_history(
+                                {
+                                    "instruction": normalized_intent,
+                                    "status": "manual_takeover_required",
                                     "reason": evaluation["reason"],
                                 }
                             )
@@ -329,3 +357,75 @@ class AgentWorker(QObject):
             operations=operations,
             metadata={"source": "stepwise_execution"},
         )
+
+    @staticmethod
+    def _detect_unmet_required_side_effect(
+        instruction: str,
+        executed_steps: List[Dict[str, Any]],
+    ) -> str:
+        text = str(instruction or "")
+        lowered = text.lower()
+        requires_spreadsheet_write = any(
+            token in text for token in ["写入", "填写", "单元格", "表格", "工作表", "Excel", "WPS"]
+        ) or any(token in lowered for token in [".xlsx", ".xls", ".csv", "spreadsheet"])
+        if requires_spreadsheet_write:
+            target_count = AgentWorker._infer_required_item_count(text)
+            meaningful_items: List[str] = []
+            for item in executed_steps:
+                if str(item.get("kind", "") or "") != "spreadsheet.write_cell":
+                    continue
+                output = item.get("output")
+                if not isinstance(output, dict) or output.get("error"):
+                    continue
+                written_lines = output.get("written_lines", [])
+                candidates = written_lines if isinstance(written_lines, list) and written_lines else str(
+                    output.get("text", "") or ""
+                ).splitlines()
+                for candidate in candidates:
+                    normalized = AgentWorker._normalize_meaningful_item(candidate)
+                    if normalized and normalized not in meaningful_items:
+                        meaningful_items.append(normalized)
+            if len(meaningful_items) >= target_count:
+                return ""
+            return "The required spreadsheet write step has not been completed yet."
+        return ""
+
+    @staticmethod
+    def _infer_required_item_count(text: str) -> int:
+        digit_match = __import__("re").search(r"(\d+)", text)
+        if digit_match:
+            try:
+                return max(1, int(digit_match.group(1)))
+            except Exception:
+                return 1
+        if __import__("re").search(r"[三3]", text):
+            return 3
+        if __import__("re").search(r"[二2]", text):
+            return 2
+        return 1
+
+    @staticmethod
+    def _normalize_meaningful_item(value: Any) -> str:
+        import re
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*\d+\s*[\.\)\-:]\s*", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) < 2 or len(text) > 80:
+            return ""
+        placeholder_patterns = [
+            r"^title\s*\d*$",
+            r"^essay\s*title\s*\d*$",
+            r"^placeholder$",
+            r"^todo$",
+            r"^tbd$",
+            r"^第?[一二三四五六七八九十0-9]+\s*篇?\s*(标题|题目)$",
+            r"^第?[一二三四五六七八九十0-9]+\s*个?\s*(标题|题目)$",
+            r"^(标题|题目)\s*[一二三四五六七八九十0-9]*$",
+        ]
+        for pattern in placeholder_patterns:
+            if re.match(pattern, text, flags=re.IGNORECASE):
+                return ""
+        return text
