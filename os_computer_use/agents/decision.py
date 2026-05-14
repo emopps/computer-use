@@ -46,6 +46,7 @@ class DecisionAgent:
         "filesystem.write_text",
         "spreadsheet.write_cell",
         "browser.send",
+        "meeting.send_assignments",
         "command.run",
     }
 
@@ -308,6 +309,26 @@ class DecisionAgent:
                 "failed_operations": [],
             }
 
+        meeting_success_reason = self._detect_meeting_assignment_delivery_success(
+            instruction, task_spec, execution_results
+        )
+        if meeting_success_reason:
+            return {
+                "satisfied": True,
+                "reason": meeting_success_reason,
+                "manual_takeover_required": False,
+                "failed_operations": [],
+            }
+
+        meeting_insufficient = self._detect_meeting_extract_insufficient_tasks(instruction, execution_results)
+        if meeting_insufficient:
+            return {
+                "satisfied": False,
+                "reason": meeting_insufficient,
+                "manual_takeover_required": False,
+                "failed_operations": [],
+            }
+
         if self.provider is None:
             # 无 LLM 时，仅基于执行状态判断（有失败则不满足）
             failed = [
@@ -342,7 +363,10 @@ class DecisionAgent:
             "评估标准：\n"
             "1. 用户要求的所有操作是否都成功执行\n"
             "2. 执行结果的内容是否有意义（不是占位符、错误信息或空值）\n"
-            "3. 搜索结果是否包含实际数据（不是重复的链接标题）\n\n"
+            "3. 搜索结果是否包含实际数据（不是重复的链接标题）\n"
+            "4. 会议/腾讯会议转写类：若 meeting.extract_actions 的 JSON 中 assignments 含非空 tasks，"
+            "且（若用户要求发邮件）meeting.send_assignments 已成功发送，则应视为已提取待办并完成投递；"
+            "不要求在本摘要中粘贴完整逐字稿，待办体现在邮件与 assignments 字段即可。\n\n"
             f"用户指令：{instruction}\n\n"
             f"执行结果：\n{results_summary}\n\n"
             "返回JSON：{ \"satisfied\": boolean, \"reason\": \"评估理由\" }\n"
@@ -383,7 +407,12 @@ class DecisionAgent:
     ) -> str:
         instruction_text = str(instruction or "")
         wants_titles = any(token in instruction_text.lower() for token in ["title", "titles"]) or ("标题" in instruction_text)
-        if not wants_titles:
+        wants_composition_titles = (
+            "作文" in instruction_text
+            or "范文" in instruction_text
+            or "composition" in instruction_text.lower()
+        )
+        if not wants_titles or not wants_composition_titles:
             return ""
 
         write_results: List[str] = []
@@ -450,7 +479,28 @@ class DecisionAgent:
         task_spec: TaskSpec,
         execution_results: Dict[str, Any],
     ) -> str:
-        has_search = any(operation.kind == "browser.search" for operation in task_spec.operations)
+        if str((task_spec.metadata or {}).get("scenario", "") or "") == "research_literature":
+            research_rows = []
+            for operation in task_spec.operations:
+                if operation.kind != "spreadsheet.write_cell":
+                    continue
+                cell = str(operation.arguments.get("cell", "") or "").upper()
+                if not re.match(r"^[A-D][2-9]\d*$", cell):
+                    continue
+                result = execution_results.get(operation.id)
+                if not isinstance(result, dict) or result.get("error"):
+                    continue
+                text = str(result.get("text", "") or "").strip()
+                if not text or "搜索完成，但没有提取到足够可靠的结果" in text:
+                    continue
+                research_rows.append((cell, text))
+            if research_rows:
+                return "已完成文献结果写入。"
+
+        has_search = any(
+            operation.kind in ("browser.search", "scholar.baidu_search", "research.collect_literature")
+            for operation in task_spec.operations
+        )
         if not has_search:
             return ""
 
@@ -504,6 +554,8 @@ class DecisionAgent:
             r"^placeholder$",
             r"^todo$",
             r"^tbd$",
+            r"^搜索完成，但没有提取到足够可靠的结果$",
+            r"^搜索完成，但当前没有可读取的页面$",
             r"^section\s*\d*$",
             r"^part\s*\d*$",
             r"^第?[一二三四五六七八九十0-9]+\s*篇?\s*(标题|题目)$",
@@ -537,6 +589,91 @@ class DecisionAgent:
             return 1
         return default
 
+    @staticmethod
+    def _meeting_extract_payload(execution_results: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        best: Optional[Dict[str, Any]] = None
+        for result in execution_results.values():
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            assignments = result.get("assignments")
+            if not isinstance(assignments, list) or not assignments:
+                continue
+            if best is None or len(assignments) > len(best.get("assignments") or []):
+                best = result
+        return best
+
+    @staticmethod
+    def _meeting_mail_sent(execution_results: Dict[str, Any]) -> bool:
+        for result in execution_results.values():
+            if not isinstance(result, dict) or result.get("error"):
+                continue
+            try:
+                if int(result.get("sent_count", 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            for row in result.get("results") or []:
+                if isinstance(row, dict) and str(row.get("status", "") or "") == "sent":
+                    return True
+        return False
+
+    def _detect_meeting_assignment_delivery_success(
+        self,
+        instruction: str,
+        task_spec: TaskSpec,
+        execution_results: Dict[str, Any],
+    ) -> str:
+        """当抽取结果含发言人待办且（若要求发信）已成功发信时，直接判定满足，避免 LLM 误读摘要。"""
+        _ = task_spec
+        extract_payload = self._meeting_extract_payload(execution_results)
+        if extract_payload is None:
+            return ""
+        assignments = extract_payload.get("assignments") or []
+        has_speaker_tasks = False
+        for a in assignments:
+            if not isinstance(a, dict):
+                continue
+            for t in a.get("tasks") or []:
+                if str(t).strip():
+                    has_speaker_tasks = True
+                    break
+            if has_speaker_tasks:
+                break
+        if not has_speaker_tasks:
+            return ""
+        text = str(instruction or "")
+        wants_mail = any(t in text for t in ("发邮件", "发送邮件", "邮件", "邮箱", "一键发送"))
+        if wants_mail:
+            if not self._meeting_mail_sent(execution_results):
+                return ""
+            return (
+                "会议任务：抽取结果已包含发言人的具体待办（assignments.tasks），且任务分配邮件已成功发送。"
+                "完整逐字稿通常保留在会议转写页或抽取字段 transcript_text 中，不要求在本评估摘要中重复全文；"
+                "待办列表体现在邮件正文与抽取 JSON 中即视为已满足「读取并提取待办并发信」类指令。"
+            )
+        return (
+            "会议任务：抽取结果已包含发言人的具体待办，并已生成纪要相关工件（如 summary_path / assignments_path）。"
+        )
+
+    @staticmethod
+    def _detect_meeting_extract_insufficient_tasks(instruction: str, execution_results: Dict[str, Any]) -> str:
+        text = str(instruction or "")
+        if not any(t in text for t in ("待办", "任务分配", "行动项", "每位发言", "提取")):
+            return ""
+        payload = DecisionAgent._meeting_extract_payload(execution_results)
+        if payload is None:
+            return ""
+        assignments = payload.get("assignments") or []
+        if not assignments:
+            return "会议抽取结果中没有任何发言人的任务条目，无法满足按发言人提取待办的要求。"
+        has_tasks = any(
+            isinstance(a, dict) and any(str(t).strip() for t in (a.get("tasks") or []))
+            for a in assignments
+        )
+        if not has_tasks:
+            return "会议抽取结果中未包含具体待办事项（各 owner 的 tasks 为空），无法满足提取发言人待办的要求。"
+        return ""
+
     def _summarize_results(self, task_spec: TaskSpec, execution_results: Dict[str, Any]) -> str:
         """Build a concise execution summary for decision evaluation."""
         lines = []
@@ -559,6 +696,38 @@ class DecisionAgent:
             if reason:
                 return "{} (useful={}, reason={})".format(text, useful, reason)
             return "{} (useful={})".format(text, useful)
+        if operation_kind == "meeting.extract_actions":
+            assignments = result.get("assignments") or []
+            owners = []
+            task_lines = 0
+            for a in assignments:
+                if not isinstance(a, dict):
+                    continue
+                o = str(a.get("owner", "") or "").strip()
+                if o:
+                    owners.append(o)
+                for t in a.get("tasks") or []:
+                    if str(t).strip():
+                        task_lines += 1
+            title = str(result.get("meeting_title", "") or "").strip()
+            tlen = len(str(result.get("transcript_text", "") or "").strip())
+            return (
+                "meeting_title={}; assignments={} owners={}; non_empty_task_lines={}; "
+                "transcript_text_len={}; paths summary_path={} assignments_path={}".format(
+                    title or "(empty)",
+                    len(assignments),
+                    owners,
+                    task_lines,
+                    tlen,
+                    str(result.get("summary_path", "") or ""),
+                    str(result.get("assignments_path", "") or ""),
+                )
+            )
+        if operation_kind == "meeting.send_assignments":
+            sc = int(result.get("sent_count", 0) or 0)
+            results = result.get("results") or []
+            owners = [str(r.get("owner", "")) for r in results if isinstance(r, dict)]
+            return "sent_count={}; recipients={}".format(sc, owners)
         return str(result.get("text", result.get("output", result)))
 
     def _detect_unusable_search_results(

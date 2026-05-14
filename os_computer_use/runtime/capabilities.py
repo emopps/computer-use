@@ -4,8 +4,12 @@ from typing import Iterable, List
 
 
 SUPPORTED_OPERATION_KINDS = (
+    "meeting.extract_actions",
+    "meeting.send_assignments",
+    "research.collect_literature",
     "browser.open",
     "browser.search",
+    "scholar.baidu_search",
     "browser.send",
     "spreadsheet.open",
     "spreadsheet.write_cell",

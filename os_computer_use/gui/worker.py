@@ -16,6 +16,7 @@ from os_computer_use.app_runtime import (
 )
 from os_computer_use.agents.intent import TaskClarificationRequired, TaskPlanningError
 from os_computer_use.logging import logger
+from os_computer_use.runtime.meeting_checkpoint import clear_checkpoint, load_checkpoint_for_prompt, persist_checkpoint_for_prompt
 from os_computer_use.runtime.task_models import OperationSpec, TaskSpec
 
 
@@ -161,6 +162,7 @@ class AgentWorker(QObject):
             pass
 
         normalized_input = prompt.strip()
+        checkpoint_seed_steps = load_checkpoint_for_prompt(normalized_input)
         clarification_rounds = 0
         max_clarification_rounds = 3
         max_decision_retries = 2
@@ -172,13 +174,12 @@ class AgentWorker(QObject):
                     raise TaskCancelledError("\u4efb\u52a1\u5df2\u53d6\u6d88\u3002")
                 normalized_intent = agents["intent"].normalize(normalized_input)
                 evaluation = {"satisfied": False, "reason": "not executed"}
-                executed_steps: List[Dict[str, Any]] = []
+                executed_steps: List[Dict[str, Any]] = [dict(item) for item in checkpoint_seed_steps]
                 execution_results: Dict[str, Any] = {}
                 previous_task_spec = None
                 planning_error = None
                 decision_attempt = 0
                 cycle_count = 0
-
                 while True:
                     if self._cancel_event.is_set():
                         raise TaskCancelledError("\u4efb\u52a1\u5df2\u53d6\u6d88\u3002")
@@ -228,6 +229,7 @@ class AgentWorker(QObject):
                             "green" if evaluation["satisfied"] else "yellow",
                         )
                         if evaluation["satisfied"]:
+                            clear_checkpoint()
                             agents["memory"].append_history(
                                 {
                                     "instruction": normalized_intent,
@@ -283,6 +285,7 @@ class AgentWorker(QObject):
                         memory_agent=agents["memory"],
                         max_replans=2,
                         replan_callback=self._handle_progress,
+                        previous_results=executed_steps,
                         should_cancel=lambda: self._cancel_event.is_set(),
                     )
                     cycle_count += 1
@@ -299,6 +302,7 @@ class AgentWorker(QObject):
                                 "output": execution_results.get(operation.id),
                             }
                         )
+                    persist_checkpoint_for_prompt(normalized_input, executed_steps)
 
                 agents["memory"].summarize_session(normalized_intent, evaluation)
                 execution_results = {item["eval_id"]: item["output"] for item in executed_steps}
@@ -388,6 +392,20 @@ class AgentWorker(QObject):
             if len(meaningful_items) >= target_count:
                 return ""
             return "The required spreadsheet write step has not been completed yet."
+        requires_assignment_extract = any(token in text for token in ["会议", "纪要", "转写", "摘要"]) and any(
+            token in text for token in ["任务分配", "待办", "行动项", "每个发言", "发言的人要做什么"]
+        )
+        if requires_assignment_extract and not any(
+            str(item.get("kind", "") or "") == "meeting.extract_actions" for item in executed_steps
+        ):
+            return "The meeting assignment extraction step has not been completed yet."
+        requires_assignment_send = any(token in text for token in ["发邮件", "发送邮件", "邮件", "邮箱"]) and any(
+            token in text for token in ["会议", "纪要", "任务分配", "转写", "摘要"]
+        )
+        if requires_assignment_send and not any(
+            str(item.get("kind", "") or "") in {"meeting.send_assignments", "browser.send"} for item in executed_steps
+        ):
+            return "The required meeting assignment email delivery step has not been completed yet."
         return ""
 
     @staticmethod

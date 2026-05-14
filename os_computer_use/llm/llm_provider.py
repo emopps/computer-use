@@ -5,6 +5,7 @@ import base64
 import requests
 import os
 import time
+from typing import Any, List, Optional
 
 try:
     from llama_cpp import Llama
@@ -122,8 +123,18 @@ class LLMProvider:
             headers["Content-Type"] = "application/json; charset=utf-8"
             session = requests.Session()
             session.trust_env = bool(getattr(self, "requests_trust_env", True))
+            request_url = f"{self.base_url}/chat/completions"
+            print(
+                "[LLM] provider={} model={} url={} timeout={} trust_env={}".format(
+                    self.__class__.__name__,
+                    self.model,
+                    request_url,
+                    timeout,
+                    session.trust_env,
+                )
+            )
             response = session.post(
-                f"{self.base_url}/chat/completions",
+                request_url,
                 headers=headers,
                 data=payload_bytes,
                 timeout=timeout,
@@ -133,7 +144,12 @@ class LLMProvider:
         except requests.exceptions.RequestException as e:
             print(f"API 请求失败: {e}")
             if hasattr(e, 'response') and e.response is not None:
-                print(f"详情: {e.response.text}")
+                status_code = getattr(e.response, "status_code", "unknown")
+                response_text = str(getattr(e.response, "text", "") or "").strip()
+                if len(response_text) > 800:
+                    response_text = response_text[:800] + "..."
+                print(f"状态码: {status_code}")
+                print(f"详情: {response_text}")
             raise Exception(f"调用模型失败: {str(e)}")
 
     def local_completion(self, messages, **kwargs):
@@ -233,10 +249,10 @@ class AnthropicBaseProvider(LLMProvider):
 class OpenRouterProvider(OpenAIBaseProvider):
     base_url = "https://openrouter.ai/api/v1"
     
-    def __init__(self, model, api_key=None):
+    def __init__(self, model, api_key=None, enable_reasoning=True):
         super().__init__(model)
-        # 支持传入不同的 API Key，方便不同模型使用不同的 Key
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.enable_reasoning = bool(enable_reasoning)
         if not self.local_llm and not self.api_key:
             raise ValueError(
                 "OPENROUTER_API_KEY is required when using OpenRouterProvider without a local model."
@@ -245,25 +261,86 @@ class OpenRouterProvider(OpenAIBaseProvider):
         self.requests_trust_env = trust_env in {"1", "true", "yes", "on"}
 
     def completion(self, messages, **kwargs):
-        # 本地模型不走远程API
         if self.local_llm:
             return self.local_completion(messages, **kwargs)
-        # OpenRouter reasoning specific: extra_body={"reasoning": {"enabled": True}}
-        if "extra_body" not in kwargs:
-            kwargs["extra_body"] = {"reasoning": {"enabled": True}}
         last_error = None
-        endpoints = self._candidate_base_urls()
-        for index, base_url in enumerate(endpoints):
-            previous_base_url = self.base_url
-            self.base_url = base_url
+        for reasoning_enabled in self._reasoning_attempts():
+            for endpoint_index, base_url in enumerate(self._candidate_base_urls()):
+                previous_base_url = self.base_url
+                self.base_url = base_url
+                attempt_kwargs = dict(kwargs)
+                extra_body = dict(attempt_kwargs.get("extra_body") or {})
+                if reasoning_enabled:
+                    extra_body["reasoning"] = {"enabled": True}
+                else:
+                    extra_body.pop("reasoning", None)
+                if extra_body:
+                    attempt_kwargs["extra_body"] = extra_body
+                else:
+                    attempt_kwargs.pop("extra_body", None)
+                self._log_openrouter_attempt(
+                    phase="start",
+                    model=self.model,
+                    base_url=base_url,
+                    reasoning_enabled=reasoning_enabled,
+                    timeout=attempt_kwargs.get("timeout", 120),
+                )
+                try:
+                    return self._completion_with_retries(
+                        messages,
+                        model_name=self.model,
+                        base_url=base_url,
+                        reasoning_enabled=reasoning_enabled,
+                        **attempt_kwargs,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    self._log_openrouter_attempt(
+                        phase="failed",
+                        model=self.model,
+                        base_url=base_url,
+                        reasoning_enabled=reasoning_enabled,
+                        error=str(exc),
+                    )
+                    if endpoint_index < len(self._candidate_base_urls()) - 1:
+                        time.sleep(1.0 + endpoint_index)
+                finally:
+                    self.base_url = previous_base_url
+        raise last_error or Exception("OpenRouter request failed.")
+
+    def _completion_with_retries(self, messages, model_name=None, base_url=None, reasoning_enabled=None, **kwargs):
+        last_error = None
+        for attempt in range(3):
             try:
+                self._log_openrouter_attempt(
+                    phase="request",
+                    model=model_name or self.model,
+                    base_url=base_url or self.base_url,
+                    reasoning_enabled=bool(reasoning_enabled),
+                    retry=attempt + 1,
+                )
                 return super().completion(messages, **kwargs)
             except Exception as exc:
                 last_error = exc
-                if index < len(endpoints) - 1:
-                    time.sleep(1.0 + index)
-            finally:
-                self.base_url = previous_base_url
+                message = str(exc)
+                should_retry = any(
+                    token in message
+                    for token in [
+                        "500 Server Error",
+                        "502 Server Error",
+                        "503 Server Error",
+                        "504 Server Error",
+                        "429 Client Error",
+                        "Failed to establish a new connection",
+                        "Network is unreachable",
+                        "网络不可达",
+                        "Read timed out",
+                        "ConnectTimeout",
+                    ]
+                )
+                if not should_retry or attempt >= 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
         raise last_error or Exception("OpenRouter request failed.")
 
     def transform_message(self, message):
@@ -289,6 +366,38 @@ class OpenRouterProvider(OpenAIBaseProvider):
             if item and item not in unique:
                 unique.append(item)
         return unique
+
+    def _reasoning_attempts(self) -> List[bool]:
+        return [bool(self.enable_reasoning)]
+
+    def _log_openrouter_attempt(
+        self,
+        *,
+        phase: str,
+        model: str,
+        base_url: str,
+        reasoning_enabled: bool,
+        timeout: Optional[Any] = None,
+        retry: Optional[int] = None,
+        error: str = "",
+    ) -> None:
+        parts = [
+            "[OpenRouter]",
+            f"phase={phase}",
+            f"model={model}",
+            f"endpoint={base_url}",
+            f"reasoning={'on' if reasoning_enabled else 'off'}",
+        ]
+        if timeout is not None:
+            parts.append(f"timeout={timeout}")
+        if retry is not None:
+            parts.append(f"retry={retry}")
+        if error:
+            compact_error = str(error).replace("\n", " ").strip()
+            if len(compact_error) > 400:
+                compact_error = compact_error[:400] + "..."
+            parts.append(f"error={compact_error}")
+        print(" ".join(parts))
 
     def call(self, messages, functions=None):
         tools = self.create_function_schema(functions) if functions else None

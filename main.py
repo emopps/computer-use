@@ -4,6 +4,9 @@ import argparse
 import os
 import sys
 
+TEST_163_USERNAME = "test_meeting2026@163.com"
+TEST_163_PASSWORD = "Haha1234"
+
 
 def _desired_linux_im_env() -> dict[str, str]:
     if not sys.platform.startswith("linux"):
@@ -61,6 +64,8 @@ def _apply_runtime_model_overrides(args) -> None:
         os.environ["OCU_TEXT_PROVIDER"] = args.text_provider
     if args.vision_provider:
         os.environ["OCU_VISION_PROVIDER"] = args.vision_provider
+    if args.disable_visual_fallback:
+        os.environ["OCU_ENABLE_VISUAL_FALLBACK"] = "0"
     if args.text_model:
         os.environ["OPENROUTER_MODEL"] = args.text_model
     if args.vision_model:
@@ -77,10 +82,16 @@ def _apply_runtime_model_overrides(args) -> None:
         os.environ["LOCAL_LLAMA_CPP_VISION_MODEL"] = args.llama_cpp_vision_model
 
 
+def _apply_test_163_mail_credentials() -> None:
+    os.environ.setdefault("OCU_163_USERNAME", TEST_163_USERNAME)
+    os.environ.setdefault("OCU_163_PASSWORD", TEST_163_PASSWORD)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Open Computer Use GUI")
     parser.add_argument("--text-provider", choices=["local", "openrouter"], help="文本模型来源")
-    parser.add_argument("--vision-provider", choices=["local", "openrouter"], help="视觉模型来源")
+    parser.add_argument("--vision-provider", choices=["none", "local", "openrouter"], help="视觉模型来源")
+    parser.add_argument("--disable-visual-fallback", action="store_true", help="关闭视觉兜底执行")
     parser.add_argument("--text-model", help="OpenRouter 文本模型名，建议使用免费模型")
     parser.add_argument("--vision-model", help="OpenRouter 视觉模型名，建议使用免费模型")
     parser.add_argument("--local-reasoning-model", help="本地文本模型路径")
@@ -91,6 +102,7 @@ def main() -> int:
     args = parser.parse_args()
 
     _apply_runtime_model_overrides(args)
+    _apply_test_163_mail_credentials()
     from os_computer_use.gui.main_window import launch
 
     return launch()

@@ -18,6 +18,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_SERVER_LOG = "output/llama_cpp_vision_server.log"
 DEFAULT_PID_FILE = "output/llama_cpp_vision_server.pid"
+TEST_163_USERNAME = "test_meeting2026@163.com"
+TEST_163_PASSWORD = "Haha1234"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for llama.cpp server startup.",
     )
     return parser
+
+
+def apply_test_163_mail_credentials() -> None:
+    os.environ.setdefault("OCU_163_USERNAME", TEST_163_USERNAME)
+    os.environ.setdefault("OCU_163_PASSWORD", TEST_163_PASSWORD)
 
 
 def ensure_file(path_str: str, label: str) -> Path:
@@ -326,6 +333,7 @@ def run_visual_only(args) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
+    apply_test_163_mail_credentials()
     model_path = ensure_file(args.model, "Model")
     mmproj_path = ensure_file(args.mmproj, "mmproj")
 

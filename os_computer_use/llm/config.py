@@ -7,16 +7,13 @@ DEFAULT_QWEN3_VL_GGUF_DIR = "/data/usershare/models/Qwen3-VL-2B-Instruct-GGUF"
 DEFAULT_QWEN3_VL_GGUF_MODEL = DEFAULT_QWEN3_VL_GGUF_DIR + "/Qwen3VL-2B-Instruct-Q4_K_M.gguf"
 
 TEXT_PROVIDER = str(os.getenv("OCU_TEXT_PROVIDER", "openrouter") or "openrouter").strip().lower()
-VISION_PROVIDER = str(os.getenv("OCU_VISION_PROVIDER", "local") or "local").strip().lower()
+VISION_PROVIDER = str(os.getenv("OCU_VISION_PROVIDER", "none") or "none").strip().lower()
 
 LOCAL_REASONING_MODEL_PATH = os.getenv(
     "LOCAL_REASONING_MODEL_PATH",
     "/data/usershare/models/qwen2.5-3b-instruct-q4_k_m.gguf",
 ).strip()
-OPENROUTER_REASONING_MODEL = os.getenv(
-    "OPENROUTER_MODEL",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-).strip()
+OPENROUTER_REASONING_MODEL = "openai/gpt-oss-120b:free"
 OPENROUTER_VISION_MODEL = os.getenv(
     "OPENROUTER_VISION_MODEL",
     "nvidia/nemotron-nano-12b-v2-vl:free",
@@ -59,7 +56,7 @@ def _build_local_vision_provider():
 
 
 def _build_openrouter_text_provider():
-    return providers.OpenRouterProvider(OPENROUTER_REASONING_MODEL)
+    return providers.OpenRouterProvider(OPENROUTER_REASONING_MODEL, enable_reasoning=True)
 
 
 def _build_local_text_provider():
@@ -67,7 +64,7 @@ def _build_local_text_provider():
 
 
 def _build_openrouter_vision_provider():
-    return providers.OpenRouterProvider(OPENROUTER_VISION_MODEL)
+    return providers.OpenRouterProvider(OPENROUTER_VISION_MODEL, enable_reasoning=False)
 
 
 def _build_text_provider():
@@ -77,6 +74,8 @@ def _build_text_provider():
 
 
 def _build_vision_provider():
+    if VISION_PROVIDER in {"", "none", "off", "disabled", "disable"}:
+        return None
     if VISION_PROVIDER == "openrouter":
         return _build_openrouter_vision_provider()
     return _build_local_vision_provider()

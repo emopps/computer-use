@@ -15,11 +15,150 @@ from os_computer_use.runtime.event_schema import build_execution_event
 from os_computer_use.runtime.scheduler import DAGScheduler
 from os_computer_use.runtime.scheduler import SchedulerNode
 from os_computer_use.runtime.task_models import ExecutionContext, OperationResult, OperationStatus, TaskModelError, TaskSpec
+from os_computer_use.desktop import research_literature_workflow
 
 
 class PlannerAgent:
     def __init__(self, provider: Optional[Any] = None):
         self.provider = provider
+
+    @staticmethod
+    def _extract_meeting_url(instruction: str) -> str:
+        match = re.search(r"https?://meeting\.tencent\.com/[^\s]+", str(instruction or ""), flags=re.IGNORECASE)
+        return str(match.group(0)).strip() if match else ""
+
+    @staticmethod
+    def _is_meeting_assignment_scenario(instruction: str) -> bool:
+        text = str(instruction or "")
+        lowered = text.lower()
+        return (
+            "meeting.tencent.com" in lowered
+            and any(token in text for token in ["会议", "纪要", "转写", "摘要"])
+            and any(token in text for token in ["任务分配", "待办", "发邮件", "发送", "每个发言"])
+        )
+
+    @staticmethod
+    def _has_completed_kind(previous_results: Optional[Any], kind: str) -> bool:
+        if not isinstance(previous_results, list):
+            return False
+        for item in previous_results:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("kind", "") or "") == kind and item.get("output") is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _mail_delivery_succeeded(previous_results: Optional[Any]) -> bool:
+        """会议任务邮件：仅当存在已实际发出（sent）的记录时才视为完成，避免失败/占位 output 误判。"""
+        if not isinstance(previous_results, list):
+            return False
+        for item in previous_results:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "") or "")
+            if kind not in {"meeting.send_assignments", "browser.send"}:
+                continue
+            output = item.get("output")
+            if not isinstance(output, dict):
+                continue
+            if output.get("error"):
+                continue
+            try:
+                if int(output.get("sent_count", 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            for row in output.get("results") or []:
+                if isinstance(row, dict) and str(row.get("status", "") or "") == "sent":
+                    return True
+        return False
+
+    def _maybe_build_meeting_workflow_plan(self, instruction: str, previous_results: Optional[Any]) -> Optional[TaskSpec]:
+        if not self._is_meeting_assignment_scenario(instruction):
+            return None
+        meeting_url = self._extract_meeting_url(instruction)
+        if not meeting_url:
+            raise TaskClarificationRequired("请提供腾讯会议纪要页面链接。")
+
+        extracted_done = self._has_completed_kind(previous_results, "meeting.extract_actions")
+        mail_done = self._mail_delivery_succeeded(previous_results)
+
+        if not self._has_completed_kind(previous_results, "browser.open"):
+            return TaskSpec.from_dict(
+                {
+                    "summary": "打开腾讯会议纪要页面",
+                    "success_criteria": ["会议页面已在浏览器中打开"],
+                    "metadata": {"scenario": "meeting_assignment"},
+                    "operations": [
+                        {
+                            "id": "open_meeting_page",
+                            "kind": "browser.open",
+                            "description": "在浏览器中打开腾讯会议纪要页面",
+                            "arguments": {"url": meeting_url},
+                            "depends_on": [],
+                            "risky": False,
+                        }
+                    ],
+                }
+            )
+        if not extracted_done:
+            return TaskSpec.from_dict(
+                {
+                    "summary": "读取真实会议纪要并抽取任务分配",
+                    "success_criteria": ["已从真实会议页面提取每位负责人的任务"],
+                    "metadata": {"scenario": "meeting_assignment"},
+                    "operations": [
+                        {
+                            "id": "extract_meeting_actions",
+                            "kind": "meeting.extract_actions",
+                            "description": "读取浏览器中的真实腾讯会议纪要页面并提取任务分配",
+                            "arguments": {"source_url": meeting_url},
+                            "depends_on": [],
+                            "risky": False,
+                        }
+                    ],
+                }
+            )
+        if not mail_done and any(token in instruction for token in ["发邮件", "发送邮件", "邮件", "邮箱", "一键发送"]):
+            return TaskSpec.from_dict(
+                {
+                    "summary": "发送会议任务分配邮件",
+                    "success_criteria": ["已生成并发送或预览任务分配邮件"],
+                    "metadata": {"scenario": "meeting_assignment"},
+                    "operations": [
+                        {
+                            "id": "send_assignment_emails",
+                            "kind": "meeting.send_assignments",
+                            "description": "根据真实会议纪要抽取结果发送任务分配邮件",
+                            "arguments": {"from_operation": "extract_meeting_actions"},
+                            "depends_on": [],
+                            "risky": False,
+                        }
+                    ],
+                }
+            )
+        return TaskSpec.from_dict(
+            {
+                "summary": "会议纪要任务分配已完成",
+                "success_criteria": ["会议纪要已读取并完成任务分配邮件处理"],
+                "metadata": {"task_completed": True, "scenario": "meeting_assignment"},
+                "operations": [],
+            }
+        )
+
+    def _maybe_build_research_literature_plan(
+        self,
+        instruction: str,
+        previous_results: Optional[Any],
+    ) -> Optional[TaskSpec]:
+        try:
+            payload = research_literature_workflow.build_task_spec(instruction, previous_results)
+        except ValueError as exc:
+            raise TaskClarificationRequired(str(exc))
+        if payload is None:
+            return None
+        return TaskSpec.from_dict(payload)
 
     @staticmethod
     def _extract_explicit_path(instruction: str, extensions: Optional[tuple[str, ...]] = None) -> str:
@@ -90,6 +229,12 @@ class PlannerAgent:
         previous_plan: Optional[TaskSpec] = None,
         previous_results: Optional[Any] = None,
     ) -> TaskSpec:
+        deterministic_meeting_plan = self._maybe_build_meeting_workflow_plan(instruction, previous_results)
+        if deterministic_meeting_plan is not None:
+            return deterministic_meeting_plan
+        deterministic_research_plan = self._maybe_build_research_literature_plan(instruction, previous_results)
+        if deterministic_research_plan is not None:
+            return deterministic_research_plan
         if self.provider is None:
             raise TaskPlanningError("PlannerAgent requires a configured language model provider.")
 
@@ -171,7 +316,7 @@ class PlannerAgent:
             "0. 这是单步循环模式。每次只规划当前最应该执行的一个原子步骤。除非任务已经完成，否则 operations 里只保留一个当前可执行步骤。\n",
             "0a. 如果结合已完成结果判断任务已经完成，返回空 operations，并在 metadata 中设置 {\"task_completed\": true}。\n",
             "0b. 已经成功执行过的步骤不要再次规划。尤其是 spreadsheet.open / browser.open / filesystem.open_path 这类打开动作，完成后下一步应该前进到写入、搜索、复制结果等后续动作。\n",
-            "0c. 如果用户要求把搜索结果写入表格/单元格/Excel/WPS，在真正出现成功的 spreadsheet.write_cell 之前，绝不能返回 task_completed。仅完成 browser.search 仍然未完成任务。\n",
+            "0c. 如果用户要求把搜索结果写入表格/单元格/Excel/WPS，在真正出现成功的 spreadsheet.write_cell 之前，绝不能返回 task_completed。仅完成 browser.search 或 scholar.baidu_search 仍然未完成任务。\n",
             "1. 不要输出不支持的操作类型。\n",
             "2. 使用 arguments，不是 params。\n",
             "3. 使用 depends_on，不是 dependencies。\n",
@@ -182,15 +327,22 @@ class PlannerAgent:
             "6a. 重要：spreadsheet.write_cell 必须在 depends_on 中依赖 spreadsheet.open。不能在未打开文件的情况下写入单元格。始终生成 spreadsheet.open 操作并让 write_cell 依赖它。\n",
             "7. filesystem.write_text 需包含 'file_path' 和 'text'。\n",
             "8. browser.open 用 'url'。仅用于打开特定网站。默认搜索引擎是百度（https://www.baidu.com），不是 Google。\n",
-            "9. browser.search 用 'text'，保持查询语义忠实。重要：搜索任务始终用 browser.search（不是 browser.open），不要手动构造搜索URL。\n",
+            "9. 普通网页检索用 browser.search（'text'），不要手动拼搜索 URL。"
+            "境内或用户指定「百度学术」检索论文时，必须使用 scholar.baidu_search（仅需 'text'），"
+            "禁止使用带 site:xueshu.baidu.com 的 browser.search 代替；天气与一般资讯仍用 browser.search。\n",
             "10. browser.send 用 'to' 和 'body'。\n",
             "11. 如果之前的错误说某操作类型不支持，替换为支持的类型。\n",
             "12. 尽量保留用户原始语言填写文本字段。\n",
             "13. 重要：不要用 'command.run' 执行已有专门操作类型的任务（如用 'filesystem.rename' 而非通过 'command.run' 运行 'mv'）。\n",
             "14. filesystem.rename 用 'src' 指定旧路径，'new_name' 指定新文件名（不是完整路径）。\n",
             "15. 重要：不要用 browser.open 打开WPS/表格文件。用 spreadsheet.open 打开WPS文件，WPS是桌面应用，不是网站。\n",
-            "16. 当后续操作需要前序操作的结果文本时（如搜索结果），用 'from_operation' 指定源操作id，不要编造占位符文本如 '[search result]'。例如：browser.search 的 id 为 'search1'，则 filesystem.write_text 可用 {\"from_operation\": \"search1\"} 代替猜测文本。系统会自动填入实际结果。\n",
+            "16. 当后续操作需要前序操作的结果文本时（如搜索结果），用 'from_operation' 指定源操作id，不要编造占位符文本如 '[search result]'。例如：browser.search 或 scholar.baidu_search 的 id 为 'search1'，则 filesystem.write_text 可用 {\"from_operation\": \"search1\"} 代替猜测文本。系统会自动填入实际结果。\n",
+            "17. 对会议转写/会议摘要/会议纪要任务分配场景，先使用 meeting.extract_actions。它会从当前指令中抽取每位发言人的待办、生成纪要和邮件草稿，arguments 可以为空。\n",
+            "18. 如果用户要求发送会议纪要或任务分配邮件，再使用 meeting.send_assignments。优先在 arguments 中带上 from_operation 指向前一步的 meeting.extract_actions，但如果省略也不要编造邮箱。\n",
+            "19. 当用户要求发送会议任务邮件时，在真正执行完 meeting.send_assignments 或 browser.send 之前，绝不能返回 task_completed。\n",
             ]
+        if research_literature_workflow.is_research_literature_table_scenario(instruction):
+            blocks.append(research_literature_workflow.planning_prompt_addon())
         if previous_plan:
             blocks.append("Previous plan:\n")
             blocks.append(json.dumps(previous_plan, ensure_ascii=False))
@@ -238,7 +390,11 @@ class PlannerAgent:
         "filesystem.write_text": ["file_path"],
         "browser.open": ["url"],
         "browser.search": ["text"],
+        "scholar.baidu_search": ["text"],
+        "research.collect_literature": [],
         "browser.send": ["to", "body"],
+        "meeting.extract_actions": [],
+        "meeting.send_assignments": [],
         "command.run": ["command"],
         "spreadsheet.open": [],  # file_path 自动生成，不需要模型提供
         "spreadsheet.write_cell": ["cell", "text"],
@@ -1029,6 +1185,7 @@ class PlannerAgent:
         memory_agent: MemoryAgent,
         max_replans: int,
         replan_callback,
+        previous_results: Optional[Any] = None,
         should_cancel=None,
     ) -> ExecutionContext:
         current_task_spec = task_spec
@@ -1047,6 +1204,7 @@ class PlannerAgent:
                 raise TaskExecutionError("Task cancelled by user.")
             scheduler = DAGScheduler()
             context = ExecutionContext(instruction=instruction, task_spec=current_task_spec)
+            self._seed_previous_results(context, previous_results)
             memory_agent.record_task_state(
                 "planning",
                 {
@@ -1210,6 +1368,7 @@ class PlannerAgent:
 
                 if callable(should_cancel) and should_cancel():
                     raise TaskExecutionError("Task cancelled by user.")
+                action_agent.authorization_callback = audit_agent.request_authorization
                 output = await action_agent.execute(operation, context)
                 logger.log(
                     "Completed {} -> {}".format(operation.kind, self._short_output(output)),
@@ -1486,6 +1645,8 @@ class PlannerAgent:
 
             if attempt >= max_replans or any(pat in last_error for pat in _UNRECOVERABLE_ERROR_PATTERNS):
                 decision_summary = current_task_spec.metadata.get("decision_summary", {})
+                if not getattr(action_agent, "visual_fallback_enabled", False):
+                    raise TaskExecutionError(last_error)
                 logger.log("Planner switching to visual fallback...", "magenta")
                 fallback_output = await action_agent.execute_visual_fallback(
                     instruction=instruction,
@@ -1567,11 +1728,30 @@ class PlannerAgent:
                 return fallback_results
 
             logger.log("Planner retrying with failure context...", "magenta")
-            current_task_spec = self.plan(
-                instruction, previous_error=last_error, previous_plan=current_task_spec
+            current_task_spec = self.replan(
+                instruction,
+                failed_task_spec=current_task_spec,
+                failure_message=last_error or "",
+                previous_results=previous_results,
             )
 
         raise TaskExecutionError(last_error or "Task execution failed.")
+
+    @staticmethod
+    def _seed_previous_results(context: ExecutionContext, previous_results: Optional[Any]) -> None:
+        if not isinstance(previous_results, list):
+            return
+        for item in previous_results:
+            if not isinstance(item, dict):
+                continue
+            operation_id = str(item.get("operation_id", "") or "").strip()
+            if not operation_id or operation_id in context.results:
+                continue
+            context.results[operation_id] = OperationResult(
+                operation_id=operation_id,
+                status=OperationStatus.COMPLETED,
+                output=item.get("output"),
+            )
 
     @staticmethod
     def _short_output(output: Any) -> str:

@@ -29,7 +29,8 @@ class IntentAgent:
 
     def normalize(self, instruction: str) -> str:
         self._maybe_request_clarification(instruction)
-        return self._normalize_intent_with_model(instruction)
+        normalized = self._normalize_intent_with_model(instruction)
+        return self._restore_explicit_email_mappings(instruction, normalized)
 
     def _normalize_intent_with_model(self, instruction: str) -> str:
         if self.provider is None:
@@ -39,6 +40,9 @@ class IntentAgent:
             "You are the Intent Agent for a desktop computer-use system.\n"
             "Normalize the user request into a clear, concise, and executable instruction.\n"
             "Remove conversational filler, but keep all technical details (file names, paths, application names).\n"
+            "Preserve explicit identifiers exactly as written, including URLs, file paths, email addresses, and name=email mappings.\n"
+            "Do not guess, correct, merge, deduplicate, or reinterpret any explicit email address or name=email mapping.\n"
+            "If the user provides two different assignee lines, keep both lines and keep each email exactly as written, even if they are identical.\n"
             "If the user is Chinese, output the result in Chinese.\n"
             "Return only the normalized string. No JSON, no markdown.\n"
             "User instruction: {}\n"
@@ -47,6 +51,46 @@ class IntentAgent:
         
         response = self.provider.call([{"role": "user", "content": prompt}])
         return response.strip()
+
+    @staticmethod
+    def _extract_explicit_email_mappings(text: str) -> List[tuple[str, str]]:
+        mappings: List[tuple[str, str]] = []
+        pattern = re.compile(
+            r"([\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9_\-路]{0,40})\s*[=:：]\s*([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+        )
+        for line in str(text or "").splitlines():
+            for name, email in pattern.findall(line):
+                mappings.append((str(name).strip(), str(email).strip()))
+        return mappings
+
+    @classmethod
+    def _restore_explicit_email_mappings(cls, original_instruction: str, normalized_instruction: str) -> str:
+        original = str(original_instruction or "").strip()
+        normalized = str(normalized_instruction or "").strip()
+        explicit_mappings = cls._extract_explicit_email_mappings(original)
+        if not explicit_mappings or not normalized:
+            return normalized or original
+
+        original_emails = [email for _, email in explicit_mappings]
+        normalized_emails = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", normalized)
+        if normalized_emails == original_emails:
+            return normalized
+
+        original_mapping_lines = [
+            f"{name}={email}" for name, email in explicit_mappings
+        ]
+        normalized_without_mapping_lines = []
+        mapping_line_pattern = re.compile(
+            r"^\s*[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9_\-路]{0,40}\s*[=:：]\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\s*$"
+        )
+        for line in normalized.splitlines():
+            if mapping_line_pattern.match(line.strip()):
+                continue
+            normalized_without_mapping_lines.append(line.rstrip())
+        normalized_body = "\n".join(line for line in normalized_without_mapping_lines if line.strip()).strip()
+        if not normalized_body:
+            return original
+        return normalized_body + "\n" + "\n".join(original_mapping_lines)
 
     def replan(self, instruction: str, failed_task_spec: TaskSpec, failure_message: str) -> str:
         # 重新规划时返回规范化意图给 Planner 使用
@@ -72,9 +116,27 @@ class IntentAgent:
         if compound_question:
             raise TaskClarificationRequired(compound_question)
 
+        if self._requires_assignment_email_mapping(text):
+            raise TaskClarificationRequired(
+                "请补充任务负责人的邮箱映射，格式如 张三=zhangsan@example.com；李四=lisi@example.com。"
+            )
+
         # 让 planner 自然处理缺失参数：
         # - spreadsheet.open：自动生成默认路径
         # - 其他操作：planner 的 _validate_plan_params 处理依据检查
+
+    @staticmethod
+    def _requires_assignment_email_mapping(instruction: str) -> bool:
+        lowered = str(instruction or "").lower()
+        meeting_tokens = ["会议", "纪要", "转写", "摘要", "发言"]
+        send_tokens = ["邮件", "邮箱", "发邮件", "发送", "任务分配", "assign"]
+        has_meeting = any(token in instruction for token in meeting_tokens)
+        has_send = any(token in instruction for token in send_tokens) or any(
+            token in lowered for token in ["email", "mail", "send"]
+        )
+        if not (has_meeting and has_send):
+            return False
+        return re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", instruction) is None
 
     def _build_compound_task_clarification_question(self, instruction: str) -> Optional[str]:
         if not self._looks_like_create_text_then_rename(instruction):
@@ -576,6 +638,26 @@ class IntentAgent:
     def _normalize_operation_arguments(self, instruction: str, kind: str, arguments: Any) -> Dict[str, Any]:
         normalized = dict(arguments) if isinstance(arguments, dict) else {}
 
+        if kind == "browser.open":
+            candidate_url = ""
+            for key in ("url", "link", "href", "address", "target"):
+                if normalized.get(key):
+                    candidate_url = str(normalized[key])
+                    break
+            extracted_url = self._extract_first_url(candidate_url) or self._extract_first_url(instruction)
+            if extracted_url:
+                normalized["url"] = extracted_url
+
+        if kind == "meeting.extract_actions":
+            candidate_url = ""
+            for key in ("source_url", "url", "link", "href"):
+                if normalized.get(key):
+                    candidate_url = str(normalized[key])
+                    break
+            extracted_url = self._extract_first_url(candidate_url) or self._extract_first_url(instruction)
+            if extracted_url:
+                normalized["source_url"] = extracted_url
+
         if kind == "browser.search" and "text" not in normalized:
             for key in ("query", "keyword", "search_text"):
                 if normalized.get(key):
@@ -1045,6 +1127,10 @@ class IntentAgent:
 
     def _infer_open_path_from_instruction(self, instruction: str) -> Dict[str, str]:
         inferred: Dict[str, str] = {}
+        explicit_url = self._extract_first_url(instruction)
+        if explicit_url:
+            inferred["path"] = explicit_url
+            return inferred
         explicit_path = self._extract_explicit_path(instruction)
         if explicit_path:
             inferred["path"] = self._normalize_desktop_path_value(explicit_path)
@@ -1093,6 +1179,16 @@ class IntentAgent:
             if match:
                 return match.group(1).strip().rstrip("。，“”\"'")
         return ""
+
+    @staticmethod
+    def _extract_first_url(text: str) -> str:
+        payload = str(text or "").strip()
+        if not payload:
+            return ""
+        match = re.search(r"https?://[^\s\u3000,\uFF0C\u3002\uFF1B;\"'<>]+", payload, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        return match.group(0).rstrip("，。；;\"'》〉】）)")
 
     def _infer_delete_target_from_instruction(self, instruction: str) -> Dict[str, str]:
         inferred: Dict[str, str] = {}
@@ -1152,9 +1248,8 @@ class IntentAgent:
         lowered = text.lower()
         operations: List[OperationSpec] = []
 
-        url_match = re.search(r"(https?://[^\s]+)", text)
-        if url_match:
-            url = url_match.group(1)
+        url = self._extract_first_url(text)
+        if url:
             operations.append(
                 OperationSpec(
                     id="open_browser",

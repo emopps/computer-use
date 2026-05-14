@@ -14,7 +14,20 @@ import zipfile
 import tempfile
 import xml.etree.ElementTree as ET
 from urllib import parse, request
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from os_computer_use.desktop.research_literature_workflow import (
+    BAIDU_SCHOLAR_HOME_URL,
+    BAIDU_SCHOLAR_PROBE_SNAPSHOT_JS,
+    BAIDU_SCHOLAR_SELECTOR_PROBE_JS,
+    SCHOLAR_SEARCH_TEXTAREA_FALLBACKS,
+    SCHOLAR_SEARCH_TEXTAREA_SELECTOR,
+    SCHOLAR_LITERATURE_MODE_SELECTORS,
+    baidu_scholar_site_in_query,
+    build_baidu_scholar_search_url,
+    is_baidu_scholar_verification_snapshot,
+    normalize_baidu_scholar_probe_snapshot,
+)
 
 class LocalDesktop:
     def __init__(self):
@@ -30,6 +43,9 @@ class LocalDesktop:
         self._wps_window_id = None  # 记住当前操作的WPS窗口，避免多窗口冲突
         self.progress_callback = None
 
+    TEST_163_USERNAME = "test_meeting2026@163.com"
+    TEST_163_PASSWORD = "Haha1234"
+
     def _emit_progress(self, event: str, **payload) -> None:
         callback = getattr(self, "progress_callback", None)
         if not callable(callback):
@@ -38,6 +54,16 @@ class LocalDesktop:
             callback({"event": event, **payload})
         except Exception:
             return
+
+    @staticmethod
+    def _extract_first_url(text: str) -> str:
+        payload = str(text or "").strip()
+        if not payload:
+            return ""
+        match = re.search(r"https?://[^\s\u3000,\uFF0C\u3002\uFF1B;\"'<>]+", payload, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        return match.group(0).rstrip("，。；;\"'》〉】）)")
 
     def write_text_file(self, file_path, content, encoding="utf-8"):
         file_path = os.path.expanduser(file_path)
@@ -331,6 +357,30 @@ class LocalDesktop:
         self._page = page
         return page
 
+    async def _resolve_active_browser_page(self):
+        await self._ensure_browser_runtime()
+        candidate = self._page
+        try:
+            if candidate is not None and not candidate.is_closed():
+                self._page = candidate
+                return candidate
+        except Exception:
+            candidate = None
+
+        pages = []
+        try:
+            pages = list(getattr(self._browser, "pages", []) or [])
+        except Exception:
+            pages = []
+        for page in reversed(pages):
+            try:
+                if page is not None and not page.is_closed():
+                    self._page = page
+                    return page
+            except Exception:
+                continue
+        return None
+
     async def bind_browser_page(self, page_key=None, create=False):
         lock = self._ensure_browser_lock()
         async with lock:
@@ -346,12 +396,203 @@ class LocalDesktop:
         async with lock:
             page = await self._get_browser_page(page_key=page_key, create=True)
             await self._browser_action_sleep()
-            await page.goto(url, wait_until="networkidle")
+            target_url = self._extract_first_url(url) or str(url or "").strip()
+            await page.goto(target_url, wait_until="networkidle")
             self._page = page
         # 将浏览器窗口激活到前台，让用户可见
         await self._browser_action_sleep()
         self._activate_browser_window()
         return page
+
+    async def read_meeting_page(self, url="", page_key=None):
+        lock = self._ensure_browser_lock()
+        async with lock:
+            page = await self._get_browser_page(page_key=page_key, create=True)
+            target_url = self._extract_first_url(url) or str(url or "").strip()
+            current_url = ""
+            try:
+                current_url = str(page.url or "")
+            except Exception:
+                current_url = ""
+            if target_url and target_url != current_url:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2.0)
+            self._page = page
+
+            async def click_tab(tab_text: str) -> None:
+                try:
+                    await page.evaluate(
+                        """(targetText) => {
+                            const nodes = Array.from(document.querySelectorAll('button, div, span, a'));
+                            for (const el of nodes) {
+                                const text = (el.innerText || '').trim();
+                                if (text === targetText) {
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        tab_text,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
+
+            async def capture_body_text() -> str:
+                try:
+                    return await page.evaluate(
+                        """() => String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 50000)"""
+                    )
+                except Exception:
+                    return ""
+
+            async def capture_transcript_panel() -> str:
+                try:
+                    transcript_info = await page.evaluate(
+                        """() => {
+                            const root = document.querySelector('.minutes-module-list');
+                            const host = root?.firstElementChild || null;
+                            return {
+                                found: Boolean(root && host),
+                                clientHeight: Number(root?.clientHeight || 0),
+                                scrollHeight: Number(root?.scrollHeight || 0),
+                                childCount: Number(host?.children?.length || 0),
+                            };
+                        }"""
+                    )
+                    if not isinstance(transcript_info, dict) or not transcript_info.get("found"):
+                        return ""
+                    await page.evaluate("""() => {
+                        const root = document.querySelector('.minutes-module-list');
+                        if (root) root.scrollTop = 0;
+                    }""")
+                    await asyncio.sleep(0.5)
+
+                    rows: List[str] = []
+                    seen_rows = set()
+                    stable_rounds = 0
+                    previous_signature = ""
+
+                    for _ in range(160):
+                        snapshot = await page.evaluate(
+                            """() => {
+                                const trim = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                                const root = document.querySelector('.minutes-module-list');
+                                const host = root?.firstElementChild || null;
+                                if (!root || !host) {
+                                    return { rows: [], scrollTop: 0, scrollHeight: 0, clientHeight: 0, ended: false };
+                                }
+                                const visibleRows = Array.from(host.children)
+                                    .filter((el) => el.classList && el.classList.contains('minutes-module-row'))
+                                    .map((el) => trim(el.innerText || ''))
+                                    .filter(Boolean);
+                                return {
+                                    rows: visibleRows,
+                                    scrollTop: Number(root.scrollTop || 0),
+                                    scrollHeight: Number(root.scrollHeight || 0),
+                                    clientHeight: Number(root.clientHeight || 0),
+                                    ended: /转写已结束/.test(trim(host.innerText || '')),
+                                };
+                            }"""
+                        )
+                        if not isinstance(snapshot, dict):
+                            break
+                        current_rows = [str(item or "").strip() for item in (snapshot.get("rows") or []) if str(item or "").strip()]
+                        for row in current_rows:
+                            if row not in seen_rows:
+                                seen_rows.add(row)
+                                rows.append(row)
+
+                        signature = "{}|{}|{}".format(
+                            snapshot.get("scrollTop", 0),
+                            snapshot.get("scrollHeight", 0),
+                            "|".join(current_rows[-2:])[-240:],
+                        )
+                        if signature == previous_signature:
+                            stable_rounds += 1
+                        else:
+                            stable_rounds = 0
+                        previous_signature = signature
+
+                        scroll_top = int(snapshot.get("scrollTop", 0) or 0)
+                        scroll_height = int(snapshot.get("scrollHeight", 0) or 0)
+                        client_height = int(snapshot.get("clientHeight", 0) or 0)
+                        reached_bottom = scroll_top + client_height >= max(scroll_height - 8, 0)
+                        if bool(snapshot.get("ended")) or (reached_bottom and stable_rounds >= 2):
+                            break
+
+                        await page.evaluate(
+                            """() => {
+                                const root = document.querySelector('.minutes-module-list');
+                                if (!root) return;
+                                const delta = Math.max(Math.floor((root.clientHeight || 600) * 0.8), 220);
+                                root.scrollTop = Math.min((root.scrollTop || 0) + delta, root.scrollHeight || 0);
+                            }"""
+                        )
+                        await asyncio.sleep(0.45)
+
+                    if not rows:
+                        return ""
+                    return "逐字稿\n" + "\n".join(rows)
+                except Exception:
+                    return ""
+
+            await click_tab("纪要")
+            summary_view_text = await capture_body_text()
+            if not summary_view_text:
+                await click_tab("摘要")
+                summary_view_text = await capture_body_text()
+
+            await click_tab("逐字稿")
+            transcript_view_text = await capture_transcript_panel()
+            if not transcript_view_text:
+                transcript_view_text = await capture_body_text()
+
+            payload = await page.evaluate(
+                """(input) => {
+                    const summaryViewText = String(input?.summaryViewText || '');
+                    const transcriptViewText = String(input?.transcriptViewText || '');
+                    const trim = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const pickSectionText = (sourceText, keywords, limit) => {
+                        const normalizedSource = trim(sourceText || '');
+                        if (normalizedSource) {
+                            for (const token of keywords) {
+                                const idx = normalizedSource.indexOf(token);
+                                if (idx >= 0) return normalizedSource.slice(idx, idx + limit);
+                            }
+                        }
+                        return '';
+                    };
+                    const bodyText = trim(document.body?.innerText || '').slice(0, 50000);
+                    const title = trim(document.title || '');
+                    const heading = trim(document.querySelector('h1')?.innerText || '');
+                    const summaryText =
+                        pickSectionText(summaryViewText, ['会议主题'], 20000)
+                        || pickSectionText(bodyText, ['会议主题'], 20000)
+                        || trim(summaryViewText);
+                    const transcriptText =
+                        pickSectionText(transcriptViewText, ['逐字稿'], 40000)
+                        || trim(transcriptViewText);
+                    const pageUrl = String(window.location.href || '');
+                    const dateMatch = bodyText.match(/20\\d{2}[\\/-]\\d{1,2}[\\/-]\\d{1,2}\\s+\\d{1,2}:\\d{2}/);
+                    const bodyTitleMatch = bodyText.match(/返回\\s+([^\\s].+?)\\s+20\\d{2}[\\/-]\\d{1,2}[\\/-]\\d{1,2}/);
+                    return {
+                        url: pageUrl,
+                        page_title: title,
+                        meeting_title: heading || (bodyTitleMatch ? trim(bodyTitleMatch[1]) : '') || title,
+                        meeting_date: dateMatch ? dateMatch[0] : '',
+                        summary_text: summaryText,
+                        transcript_text: transcriptText,
+                        body_text: bodyText,
+                    };
+                }""",
+                {
+                    "summaryViewText": summary_view_text,
+                    "transcriptViewText": transcript_view_text,
+                },
+            )
+            return payload if isinstance(payload, dict) else {}
 
     def _activate_browser_window(self):
         """用 wmctrl 激活浏览器窗口到前台"""
@@ -371,7 +612,6 @@ class LocalDesktop:
                             return
         except Exception:
             pass
-
 
     async def browser_search(self, text, page_key=None):
         query = str(text or "").strip()
@@ -398,7 +638,13 @@ class LocalDesktop:
                     "useful": True,
                     "reason": "api_priority_answer",
                 }
-            if "baidu.com" not in current_url or "/s?" in current_url:
+            on_xueshu = "xueshu.baidu.com" in current_url
+            scholar_site, clean_query = baidu_scholar_site_in_query(query)
+            if scholar_site:
+                query = clean_query
+                await self._browser_action_sleep()
+                await page.goto(BAIDU_SCHOLAR_HOME_URL, wait_until="domcontentloaded")
+            elif not on_xueshu and ("baidu.com" not in current_url or "/s?" in current_url):
                 await self._browser_action_sleep()
                 await page.goto("https://www.baidu.com", wait_until="networkidle")
             self._page = page
@@ -409,6 +655,170 @@ class LocalDesktop:
                     if not self._should_retry_weather_query(refined_result, query):
                         return refined_result
             return primary_result
+
+    async def baidu_scholar_search(self, text, page_key=None) -> str:
+        """百度学术固定工具：打开 xueshu 首页 → 写死 textarea 选择器填词 → 提交 → 抽取结果（对齐 163 邮箱固定流）。"""
+        query = str(text or "").strip()
+        if not query:
+            return ""
+        _, query = baidu_scholar_site_in_query(query)
+        lock = self._ensure_browser_lock()
+        async with lock:
+            page = await self._get_browser_page(page_key=page_key, create=True)
+            await self._browser_action_sleep(4.5, 5.5)
+            await page.goto(BAIDU_SCHOLAR_HOME_URL, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            await self._browser_action_sleep(4.5, 5.5)
+            self._page = page
+            await self._ensure_baidu_scholar_literature_mode(page)
+            loc = await self._find_baidu_scholar_input(page)
+            if loc is None:
+                verification_result = await self._wait_for_manual_verification_clear(query)
+                if verification_result is None:
+                    page = await self._resolve_active_browser_page() or page
+                    self._page = page
+                    loc = await self._find_baidu_scholar_input(page, timeout=12.0)
+            if loc is None:
+                snapshot = await self._capture_search_page_snapshot()
+                current_url = str((snapshot or {}).get("url", "") or "")
+                current_title = str((snapshot or {}).get("title", "") or "")
+                current_text = str((snapshot or {}).get("text", "") or "").replace("\n", " ").strip()[:240]
+                raise RuntimeError(
+                    "baidu_scholar_search: 未找到学术检索框，期望主选择器 {}，当前 url={} title={} excerpt={}".format(
+                        SCHOLAR_SEARCH_TEXTAREA_SELECTOR,
+                        current_url or "<empty>",
+                        current_title or "<empty>",
+                        current_text or "<empty>",
+                    )
+                )
+            await loc.click()
+            await self._browser_action_sleep(4.5, 5.5)
+            await loc.fill("")
+            await self._browser_action_sleep(4.5, 5.5)
+            await loc.fill(query)
+            await self._browser_action_sleep(4.5, 5.5)
+            await self._submit_baidu_scholar_search(query)
+            await self._browser_action_sleep(4.5, 5.5)
+            verification_result = await self._wait_for_manual_verification_clear(query)
+            if verification_result:
+                return verification_result
+            page = await self._resolve_active_browser_page() or page
+            self._page = page
+            return await self._extract_search_results(query)
+
+    async def probe_baidu_scholar(self, text, page_key=None) -> Dict[str, Any]:
+        query = str(text or "").strip()
+        if not query:
+            return {}
+        _, query = baidu_scholar_site_in_query(query)
+        selectors = [SCHOLAR_SEARCH_TEXTAREA_SELECTOR, *SCHOLAR_SEARCH_TEXTAREA_FALLBACKS]
+        lock = self._ensure_browser_lock()
+        async with lock:
+            page = await self._get_browser_page(page_key=page_key, create=True)
+            report: Dict[str, Any] = {"query": query}
+            await page.goto(BAIDU_SCHOLAR_HOME_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(5000)
+            self._page = page
+            await self._ensure_baidu_scholar_literature_mode(page)
+            try:
+                report["selector_probe_before"] = await page.evaluate(BAIDU_SCHOLAR_SELECTOR_PROBE_JS, selectors)
+            except Exception:
+                report["selector_probe_before"] = []
+
+            used_selector = None
+            for sel in selectors:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible(timeout=1500):
+                        await loc.click(timeout=5000)
+                        await loc.fill("")
+                        await loc.fill(query)
+                        used_selector = sel
+                        break
+                except Exception:
+                    continue
+            report["used_selector"] = used_selector
+            if not used_selector:
+                report["error"] = "no_visible_search_input"
+                return report
+
+            await page.goto(build_baidu_scholar_search_url(query), wait_until="domcontentloaded")
+            await page.wait_for_timeout(7000)
+            verification_result = await self._wait_for_manual_verification_clear(query)
+            snapshot = verification_result if isinstance(verification_result, dict) else await self._capture_search_page_snapshot()
+            report["snapshot"] = normalize_baidu_scholar_probe_snapshot(snapshot)
+            try:
+                report["selector_probe_after"] = await page.evaluate(BAIDU_SCHOLAR_SELECTOR_PROBE_JS, selectors)
+            except Exception:
+                report["selector_probe_after"] = []
+            return report
+
+    async def _ensure_baidu_scholar_literature_mode(self, page) -> None:
+        for selector in SCHOLAR_LITERATURE_MODE_SELECTORS:
+            try:
+                cand = page.locator(selector).first
+                if await cand.count() > 0 and await cand.is_visible(timeout=1200):
+                    await cand.click(timeout=3000)
+                    await self._browser_action_sleep(0.8, 1.2)
+                    return
+            except Exception:
+                continue
+
+    async def _find_baidu_scholar_input(self, page, timeout: float = 20.0):
+        selectors = (SCHOLAR_SEARCH_TEXTAREA_SELECTOR,) + SCHOLAR_SEARCH_TEXTAREA_FALLBACKS
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            for sel in selectors:
+                try:
+                    cand = page.locator(sel).first
+                    if await cand.count() > 0 and await cand.is_visible(timeout=1200):
+                        return cand
+                except Exception:
+                    continue
+            try:
+                await page.wait_for_timeout(1000)
+            except Exception:
+                await asyncio.sleep(1.0)
+        return None
+
+    async def _submit_baidu_scholar_search(self, query: str) -> None:
+        page = self._page
+        if not page:
+            return
+        await self._browser_action_sleep()
+        await page.goto(build_baidu_scholar_search_url(query), wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+    async def _await_baidu_scholar_snapshot(self, query: str, attempts: int = 8) -> Dict[str, Any]:
+        last_snapshot: Dict[str, Any] = {}
+        for attempt in range(max(1, attempts)):
+            page = await self._resolve_active_browser_page()
+            if page is None:
+                await asyncio.sleep(1.0)
+                continue
+            self._page = page
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            if attempt > 0:
+                try:
+                    await page.wait_for_timeout(1200)
+                except Exception:
+                    await asyncio.sleep(1.2)
+            snapshot = await self._capture_search_page_snapshot()
+            if isinstance(snapshot, dict):
+                last_snapshot = snapshot
+                items = list(snapshot.get("scholarResults", []) or [])
+                if items:
+                    return snapshot
+        return last_snapshot
 
     async def _run_browser_search_query(self, query: str) -> str:
         input_box = await self._find_browser_search_input()
@@ -558,33 +968,79 @@ class LocalDesktop:
             return ""
 
     async def _capture_search_page_snapshot(self):
-        if not self._page:
+        page = await self._resolve_active_browser_page()
+        if not page:
             return None
         try:
-            return await self._page.evaluate(
-                """() => ({
-                    url: String(window.location.href || ''),
-                    title: String(document.title || ''),
-                    text: String(document.body?.innerText || '').slice(0, 4000)
-                })"""
+            raw_snapshot = await page.evaluate(BAIDU_SCHOLAR_PROBE_SNAPSHOT_JS)
+            snapshot = normalize_baidu_scholar_probe_snapshot(raw_snapshot)
+            snapshot["sliderCount"] = await page.locator(
+                "input[type='range'], .vcode-spin-button, .verify-slider, .slider, [class*='slider'], [class*='verify'], [class*='captcha'], [id*='verify'], [id*='captcha']"
+            ).count()
+            snapshot["iframeSources"] = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('iframe')).map((item) => String(item.src || '')).slice(0, 8)"""
             )
+            snapshot["buttonTexts"] = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('button, a, span, div')).map((item) => String(item.innerText || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 30)"""
+            )
+            if isinstance(snapshot, dict):
+                return snapshot
         except Exception:
-            return None
+            pass
+
+        fallback: Dict[str, Any] = {
+            "url": "",
+            "title": "",
+            "text": "",
+            "html": "",
+            "scholarResults": [],
+            "scholarMainText": "",
+            "sliderCount": 0,
+            "iframeSources": [],
+            "buttonTexts": [],
+        }
+        try:
+            fallback["url"] = str(page.url or "")
+        except Exception:
+            pass
+        try:
+            fallback["title"] = str(await page.title() or "")
+        except Exception:
+            pass
+        try:
+            fallback["text"] = str(await page.text_content("body") or "")[:4000]
+        except Exception:
+            pass
+        try:
+            fallback["html"] = str(await page.content() or "")[:6000]
+        except Exception:
+            pass
+        return normalize_baidu_scholar_probe_snapshot(fallback)
 
     @staticmethod
     def _is_search_verification_snapshot(snapshot) -> bool:
+        if is_baidu_scholar_verification_snapshot(snapshot):
+            return True
         if not isinstance(snapshot, dict):
             return False
         current_url = str(snapshot.get("url", "") or "")
         current_title = str(snapshot.get("title", "") or "")
+        current_html = str(snapshot.get("html", "") or "")
+        iframe_sources = snapshot.get("iframeSources", [])
+        button_texts = snapshot.get("buttonTexts", [])
+        slider_count = int(snapshot.get("sliderCount", 0) or 0)
         blob = " ".join(
             [
                 current_url,
                 current_title,
                 str(snapshot.get("text", "") or ""),
+                current_html,
+                " ".join(str(item or "") for item in iframe_sources if item),
+                " ".join(str(item or "") for item in button_texts if item),
             ]
         )
         lower_url = current_url.lower()
+        lower_blob = blob.lower()
         verification_domains = [
             "wappass.baidu.com",
             "passport.baidu.com",
@@ -600,46 +1056,77 @@ class LocalDesktop:
             return True
         if any(token in lower_url for token in verification_paths):
             return True
-        tokens = [
-            "安全验证",
-            "验证码",
+        if "百度安全验证" in current_title:
+            return True
+        strong_tokens = [
+            "百度安全验证",
+            "请完成安全验证",
+            "请完成下列验证",
             "请输入验证码",
             "异常流量",
             "访问受限",
+            "拖动滑块匹配曲线",
+            "校验失败，请再试一次",
+        ]
+        weak_tokens = [
+            "安全验证",
+            "验证码",
+            "拖动滑块",
+            "匹配曲线",
+            "校验失败",
+            "请再试一次",
             "robot",
             "captcha",
             "verify",
-            "请完成下列验证",
-            "请完成安全验证",
+            "no captcha",
+            "security check",
+            "human verification",
         ]
-        return any(token.lower() in blob.lower() for token in tokens)
+        if any(token.lower() in lower_blob for token in strong_tokens):
+            return True
+        score = 0
+        for token in weak_tokens:
+            if token.lower() in lower_blob:
+                score += 1
+        if slider_count > 0:
+            score += 2
+        if any(("captcha" in str(src).lower()) or ("verify" in str(src).lower()) for src in iframe_sources):
+            score += 2
+        return score >= 3
 
     async def _wait_for_manual_verification_clear(self, query: str):
         snapshot = await self._capture_search_page_snapshot()
         if not self._is_search_verification_snapshot(snapshot):
-            return None
+            return snapshot
 
         print("[OCU] 搜索触发验证，请人工完成验证，完成后将自动继续。")
         self._emit_progress(
             "task",
             status="waiting_manual_verification",
-            summary="检测到搜索验证，请在浏览器中手动完成验证，系统将自动继续。",
+            summary="检测到百度安全验证，请在浏览器中手动完成验证，系统将自动继续。",
         )
         deadline = time.time() + 300.0
+        next_log_at = time.time() + 10.0
         while time.time() < deadline:
-            await asyncio.sleep(1.0)
+            await self._page.wait_for_timeout(1000)
             snapshot = await self._capture_search_page_snapshot()
             if not self._is_search_verification_snapshot(snapshot):
+                print("[OCU] 百度安全验证已通过，继续执行搜索任务。")
                 self._emit_progress(
                     "task",
                     status="manual_verification_cleared",
-                    summary="验证已通过，正在继续执行搜索任务。",
+                    summary="百度安全验证已通过，正在继续执行搜索任务。",
                 )
-                await self._browser_action_sleep()
-                return None
+                await self._page.wait_for_timeout(4000)
+                return await self._capture_search_page_snapshot()
+            if time.time() >= next_log_at:
+                remaining = max(0, int(deadline - time.time()))
+                print("[OCU] 等待人工完成百度安全验证，剩余约 {} 秒。".format(remaining))
+                next_log_at = time.time() + 10.0
 
         current_url = str((snapshot or {}).get("url", "") or "")
         current_title = str((snapshot or {}).get("title", "") or "")
+        print("[OCU] 百度安全验证等待超时，请人工完成验证后重试。")
         return {
             "query": query,
             "text": "搜索触发验证，请人工完成验证后重试。",
@@ -689,7 +1176,27 @@ class LocalDesktop:
         return list(dict.fromkeys(item.strip() for item in candidates if item.strip()))
 
     async def _find_browser_search_input(self):
-        selectors = [
+        try:
+            page_url = str(self._page.url or "")
+        except Exception:
+            page_url = ""
+        selectors: List[str] = []
+        if "xueshu.baidu.com" in page_url:
+            selectors.extend(
+                [
+                    "input.ipt-search",
+                    "input[class*='search']",
+                    "input[placeholder*='作者']",
+                    "input[placeholder*='标题']",
+                    "input[placeholder*='关键词']",
+                    "input[placeholder*='检索']",
+                    "input[placeholder*='搜索']",
+                    ".search-area input[type='text']",
+                    "form input[type='text']",
+                ]
+            )
+        selectors.extend(
+            [
             "#chat-textarea",
             "#kw",
             "input[name='wd']",
@@ -698,7 +1205,8 @@ class LocalDesktop:
             "textarea",
             "input[type='search']",
             "input[type='text']",
-        ]
+            ]
+        )
         for selector in selectors:
             try:
                 element = self._page.locator(selector).first
@@ -829,14 +1337,31 @@ class LocalDesktop:
             pass
 
     async def _submit_browser_search(self) -> None:
-        selectors = [
+        try:
+            page_url = str(self._page.url or "")
+        except Exception:
+            page_url = ""
+        selectors: List[str] = []
+        if "xueshu.baidu.com" in page_url:
+            selectors.extend(
+                [
+                    "button[type='submit']",
+                    "button.s-btn-search",
+                    ".search-btn",
+                    "button[class*='search']",
+                    "a[class*='search-btn']",
+                ]
+            )
+        selectors.extend(
+            [
             "#su",
             ".s_btn",
             "input[type='submit']",
             ".chat-input-send-btn",
             "button:has-text('搜索')",
             "button:has-text('百度一下')",
-        ]
+            ]
+        )
         for selector in selectors:
             try:
                 button = self._page.locator(selector).first
@@ -1531,96 +2056,327 @@ class LocalDesktop:
             return False
         return True
 
-    async def browser_send(self, to, subject="", body="", attachments=None, page_key=None):
+    @staticmethod
+    def _is_163_mail_url(url: str) -> bool:
+        current = str(url or "").strip().lower()
+        return "mail.163.com" in current
+
+    @staticmethod
+    def _looks_like_163_mail_body(text: str) -> bool:
+        payload = str(text or "")
+        markers = ["写 信", "收 信", "收件箱", "主　题：", "收件人：", "邮件发送成功"]
+        return any(marker in payload for marker in markers)
+
+    @classmethod
+    def _looks_like_163_mail_page(cls, url: str, text: str = "") -> bool:
+        return cls._is_163_mail_url(url) or cls._looks_like_163_mail_body(text)
+
+    @staticmethod
+    def _build_163_editor_html(text: str) -> str:
+        lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        normalized = lines or [""]
+        escaped = []
+        for line in normalized:
+            safe = (
+                str(line)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            escaped.append(f"<div>{safe or '&nbsp;'}</div>")
+        return "".join(escaped)
+
+    async def _get_page_text(self, page) -> str:
+        try:
+            return await page.locator("body").inner_text(timeout=5000)
+        except Exception:
+            return ""
+
+    async def _ensure_163_mail_logged_in(self, page) -> bool:
+        username = str(os.getenv("OCU_163_USERNAME", self.TEST_163_USERNAME) or "").strip()
+        password = str(os.getenv("OCU_163_PASSWORD", self.TEST_163_PASSWORD) or "").strip()
+        if not username or not password:
+            return False
+
+        current_url = ""
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        current_text = await self._get_page_text(page)
+        if self._looks_like_163_mail_page(current_url, current_text) and "js6/main.jsp?sid=" in current_url:
+            return True
+
+        await page.goto("https://mail.163.com/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3.0)
+
+        login_frame = None
+        for frame in page.frames:
+            try:
+                if "dl.reg.163.com" in str(frame.url or ""):
+                    login_frame = frame
+                    break
+            except Exception:
+                continue
+        if login_frame is None:
+            refreshed_url = str(page.url or "")
+            refreshed_text = await self._get_page_text(page)
+            return "js6/main.jsp?sid=" in refreshed_url and self._looks_like_163_mail_page(refreshed_url, refreshed_text)
+
+        async def fill_login_form():
+            try:
+                await login_frame.locator("input[name='email']").fill(username, timeout=5000)
+                await login_frame.locator("input[name='password']").fill(password, timeout=5000)
+                await login_frame.locator("#dologin").click(timeout=5000)
+                return
+            except Exception:
+                pass
+            await login_frame.eval_on_selector(
+                "input[name='email']",
+                "(el, value) => { el.focus(); el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
+                username,
+            )
+            await login_frame.eval_on_selector(
+                "input[name='password']",
+                "(el, value) => { el.focus(); el.value = value; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
+                password,
+            )
+            await login_frame.eval_on_selector("#dologin", "el => el.click()")
+
+        for _ in range(3):
+            await fill_login_form()
+            try:
+                await page.wait_for_url(re.compile(r".*/js6/main\.jsp\?sid=.*"), timeout=25000)
+                await asyncio.sleep(4.0)
+                return True
+            except Exception:
+                await asyncio.sleep(2.0)
+        return False
+
+    async def _open_163_compose(self, page) -> bool:
+        async def compose_ready() -> bool:
+            try:
+                recipient = page.locator("input.nui-editableAddr-ipt:visible").first
+                if await recipient.count() > 0 and await recipient.is_visible(timeout=1000):
+                    return True
+            except Exception:
+                pass
+            try:
+                subject_input = page.locator("input[id$='_subjectInput']:visible").first
+                if await subject_input.count() > 0 and await subject_input.is_visible(timeout=1000):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        if await compose_ready():
+            return True
+
+        for _ in range(3):
+            current_text = await self._get_page_text(page)
+            if "邮件发送成功" in current_text or "已成功发送到收件人" in current_text:
+                try:
+                    await page.evaluate(
+                        """() => {
+                            const nodes = Array.from(document.querySelectorAll('button, a, span, div'));
+                            const target = nodes.find(el => {
+                                const text = String(el.innerText || '').replace(/\s+/g, ' ').trim();
+                                return text === '继续写信';
+                            });
+                            if (target) {
+                                target.click();
+                                return true;
+                            }
+                            return false;
+                        }"""
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5)
+                if await compose_ready():
+                    return True
+
+            buttons = page.get_by_role("button")
+            try:
+                count = await buttons.count()
+            except Exception:
+                count = 0
+            if count >= 2:
+                try:
+                    await buttons.nth(1).click(force=True)
+                    await asyncio.sleep(4.0)
+                    if await compose_ready():
+                        return True
+                except Exception:
+                    pass
+            try:
+                await page.evaluate(
+                    """() => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const target = buttons.find(btn => String(btn.innerText || '').replace(/\s+/g, ' ').trim() === '写 信');
+                        if (target) {
+                            target.click();
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(3.0)
+            if await compose_ready():
+                return True
+        return False
+
+    async def _fill_163_recipient(self, page, to: str) -> bool:
+        locator = page.locator("input.nui-editableAddr-ipt:visible").first
+        if await locator.count() == 0:
+            return False
+        value = str(to or "").strip()
+        if not value:
+            return False
+        await page.eval_on_selector(
+            "input.nui-editableAddr-ipt",
+            "(el, inputValue) => { el.focus(); el.value = inputValue; el.dispatchEvent(new InputEvent('input', { bubbles: true, data: inputValue, inputType: 'insertText' })); el.dispatchEvent(new Event('change', { bubbles: true })); }",
+            value,
+        )
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(0.6)
+        return True
+
+    async def _fill_163_subject(self, page, subject: str) -> bool:
+        locator = page.locator("input[id$='_subjectInput']:visible").first
+        if await locator.count() == 0:
+            return False
+        value = str(subject or "")
+        await locator.click(timeout=3000)
+        try:
+            await locator.fill(value, timeout=5000)
+        except Exception:
+            await locator.evaluate(
+                """(el, inputValue) => {
+                    if (!el) return false;
+                    el.focus();
+                    el.value = inputValue;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }""",
+                value,
+            )
+        await asyncio.sleep(0.2)
+        return True
+
+    async def _fill_163_body(self, page, body: str) -> bool:
+        html = self._build_163_editor_html(body)
+        editor_frame = None
+        for frame in reversed(page.frames):
+            try:
+                frame_body = await frame.locator("body").first.get_attribute("contenteditable")
+                if str(frame_body or "").lower() == "true":
+                    editor_frame = frame
+                    break
+            except Exception:
+                continue
+        if editor_frame is None:
+            return False
+        await editor_frame.evaluate(
+            """(payload) => {
+                document.body.innerHTML = payload;
+                document.body.dispatchEvent(new Event('input', { bubbles: true }));
+                document.body.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            html,
+        )
+        await asyncio.sleep(0.4)
+        return True
+
+    async def _attach_163_files(self, page, attachments) -> bool:
+        if not attachments:
+            return True
+        for selector in ["input[type='file']", "input[accept]"]:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() > 0:
+                    await locator.set_input_files(list(attachments))
+                    await asyncio.sleep(1.0)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _send_163_message(self, page) -> bool:
+        buttons = page.get_by_role("button")
+        try:
+            await buttons.nth(0).click(force=True)
+        except Exception:
+            try:
+                await page.evaluate(
+                    """() => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const target = buttons.find(btn => String(btn.innerText || '').replace(/\s+/g, ' ').trim() === '发送');
+                        if (target) {
+                            target.click();
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+            except Exception:
+                return False
+        await asyncio.sleep(2.5)
+        text_after_first = await self._get_page_text(page)
+        if "保存并发送" in text_after_first:
+            try:
+                await page.evaluate(
+                    """() => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const target = buttons.find(btn => String(btn.innerText || '').replace(/\s+/g, ' ').trim() === '保存并发送');
+                        if (target) {
+                            target.click();
+                            return true;
+                        }
+                        return false;
+                    }"""
+                )
+            except Exception:
+                return False
+            await asyncio.sleep(4.0)
+        final_text = await self._get_page_text(page)
+        return "邮件发送成功" in final_text or "已成功发送到收件人" in final_text
+
+    async def browser_send(self, to, subject="", body="", attachments=None, page_key=None, authorize_before_send=None):
         lock = self._ensure_browser_lock()
         async with lock:
             page = await self._get_browser_page(page_key=page_key, create=True)
             self._page = page
             if not self._page:
                 return False
-
             attachments = list(attachments or [])
-
-            compose_selectors = [
-                "text=/写邮件|撰写|Compose|New message/i",
-                "button:has-text('写邮件')",
-                "button:has-text('撰写')",
-                "button:has-text('Compose')",
-                "a:has-text('写邮件')",
-                "a:has-text('Compose')",
-            ]
-            for selector in compose_selectors:
-                try:
-                    locator = self._page.locator(selector).first
-                    if await locator.is_visible(timeout=1500):
-                        await locator.click()
-                        await asyncio.sleep(1.0)
-                        break
-                except Exception:
-                    continue
-
-            if not await self._fill_first_visible(
-                [
-                    "input[type='email']",
-                    "input[name='to']",
-                    "input[placeholder*='收件']",
-                    "input[aria-label*='收件']",
-                    "textarea[placeholder*='收件']",
-                ],
-                to,
-            ):
+            if not await self._ensure_163_mail_logged_in(page):
                 return False
-
-            if subject:
-                await self._fill_first_visible(
-                    [
-                        "input[name='subject']",
-                        "input[placeholder*='主题']",
-                        "input[aria-label*='主题']",
-                        "input[placeholder*='Subject']",
-                    ],
-                    subject,
+            if not await self._open_163_compose(page):
+                return False
+            if not await self._fill_163_recipient(page, to):
+                return False
+            if subject and not await self._fill_163_subject(page, subject):
+                return False
+            if body and not await self._fill_163_body(page, body):
+                return False
+            if attachments and not await self._attach_163_files(page, attachments):
+                return False
+            if authorize_before_send is not None:
+                details = json.dumps(
+                    {
+                        "to": to,
+                        "subject": subject,
+                        "attachment_count": len(attachments),
+                    },
+                    ensure_ascii=False,
                 )
-
-            if body:
-                await self._fill_first_visible(
-                    [
-                        "div[contenteditable='true']",
-                        "textarea",
-                    ],
-                    body,
-                )
-
-            if attachments:
-                attached = False
-                for selector in ["input[type='file']", "input[accept]"]:
-                    try:
-                        locator = self._page.locator(selector).first
-                        if await locator.count() > 0:
-                            await locator.set_input_files(attachments)
-                            await asyncio.sleep(1.0)
-                            attached = True
-                            break
-                    except Exception:
-                        continue
-                if not attached:
+                if not bool(authorize_before_send("browser.send", details)):
                     return False
-
-            for selector in [
-                "button:has-text('发送')",
-                "button:has-text('Send')",
-                "[role='button']:has-text('发送')",
-                "[role='button']:has-text('Send')",
-            ]:
-                try:
-                    locator = self._page.locator(selector).first
-                    if await locator.is_visible(timeout=1500):
-                        await locator.click()
-                        await asyncio.sleep(2.0)
-                        return True
-                except Exception:
-                    continue
-            return False
+            return await self._send_163_message(page)
 
     async def _fill_first_visible(self, selectors, text):
         for selector in selectors:
@@ -2116,4 +2872,3 @@ class LocalDesktop:
                     except Exception:
                         continue
         return None
-
