@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import io
-import json
 import os
 import re
 import subprocess
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
+from os_computer_use.agents.intent import TaskClarificationRequired
 from os_computer_use.desktop.file_tool import FileTool
 from os_computer_use.desktop.interaction_resolver import InteractionResolver
+from os_computer_use.desktop.meeting_workflow import MeetingWorkflow
+from os_computer_use.desktop.research_literature_workflow import ResearchLiteratureWorkflow
 from os_computer_use.desktop.ui_observer import UIObserver
 from os_computer_use.desktop.visual_executor import VisualExecutor
 from os_computer_use.runtime.capabilities import SUPPORTED_OPERATION_KINDS
@@ -36,11 +39,14 @@ class ActionAgent:
         file_tool: FileTool,
         reasoning_model: Any = None,
         vision_model: Any = None,
+        artifact_dir: str = "",
     ):
         self.desktop = desktop
         self.file_tool = file_tool
         self.reasoning_model = reasoning_model
         self.vision_model = vision_model
+        self.artifact_dir = artifact_dir
+        self.authorization_callback = None
         self.supported_kinds = set(SUPPORTED_OPERATION_KINDS)
         self._visual_executor = None
         self.ui_observer = UIObserver(desktop=self.desktop)
@@ -49,6 +55,7 @@ class ActionAgent:
         # 失败计数器：同一操作类型连续失败次数，达到阈值后退回视觉
         self._failure_counts: Dict[str, int] = {}
         self._visual_fallback_threshold = 3  # 连续失败3次才退回视觉
+        self.visual_fallback_enabled = self.reasoning_model is not None and self.vision_model is not None
 
     async def execute(self, operation, context: ExecutionContext) -> Any:
         kind = operation.kind
@@ -127,7 +134,58 @@ class ActionAgent:
                     )
                 source_text = source_result.output
             return self.file_tool.extract_contract_elements(source_text)
+        if kind == "meeting.extract_actions":
+            workflow = MeetingWorkflow(provider=self.reasoning_model, artifact_root=self.artifact_dir)
+            page_key = self._browser_page_key(operation, context)
+            raw_source_url = str(args.get("source_url", "") or "").strip()
+            cleaned_source_url_match = re.search(
+                r"https?://[^\s\u3000,\uFF0C\u3002\uFF1B;\"'<>]+",
+                raw_source_url,
+                flags=re.IGNORECASE,
+            )
+            cleaned_source_url = raw_source_url
+            if cleaned_source_url_match:
+                cleaned_source_url = cleaned_source_url_match.group(0).rstrip("，。；;\"'》〉】）)")
+            meeting_page = await self.desktop.read_meeting_page(
+                url=cleaned_source_url,
+                page_key=page_key,
+            )
+            return workflow.extract_actions(context.instruction, meeting_page)
+        if kind == "meeting.send_assignments":
+            source_payload = None
+            source_operation_id = str(args.get("from_operation", "") or "").strip()
+            if source_operation_id:
+                source_result = context.results.get(source_operation_id)
+                if source_result and source_result.status == OperationStatus.COMPLETED:
+                    source_payload = source_result.output
+            if source_payload is None:
+                for result in reversed(list(context.results.values())):
+                    if result.status != OperationStatus.COMPLETED or not isinstance(result.output, dict):
+                        continue
+                    if "assignments" in result.output and "meeting_title" in result.output:
+                        source_payload = result.output
+                        break
+            if not isinstance(source_payload, dict):
+                raise TaskExecutionError("meeting.send_assignments requires a completed meeting.extract_actions result.")
+            return await self._send_meeting_assignments(
+                source_payload,
+                page_key=self._browser_page_key(operation, context),
+            )
+        if kind == "research.collect_literature":
+            workflow = ResearchLiteratureWorkflow(
+                desktop=self.desktop,
+                provider=self.reasoning_model,
+                artifact_root=self.artifact_dir,
+            )
+            return await workflow.collect_literature(
+                context.instruction,
+                file_path=str(args.get("file_path", "") or ""),
+            )
         if kind == "browser.open":
+            raw_url = str(args.get("url", "") or "").strip()
+            cleaned_url_match = re.search(r"https?://[^\s\u3000,\uFF0C\u3002\uFF1B;\"'<>]+", raw_url, flags=re.IGNORECASE)
+            if cleaned_url_match:
+                args["url"] = cleaned_url_match.group(0).rstrip("，。；;\"'》〉】）)")
             page_key = self._browser_page_key(operation, context)
             return await self._run_browser_operation(
                 page_key=page_key,
@@ -151,6 +209,22 @@ class ActionAgent:
                     context=context,
                     before_hash=before_hash,
                     primary_executor=lambda: self.desktop.browser_search(args["text"], page_key=page_key),
+                ),
+            )
+            return self._normalize_browser_search_output(args["text"], raw_result)
+        if kind == "scholar.baidu_search":
+            page_key = self._browser_page_key(operation, context)
+            raw_result = await self._run_browser_operation(
+                page_key=page_key,
+                create_page=True,
+                runner=lambda: self._execute_ui_operation(
+                    kind=kind,
+                    args=args,
+                    context=context,
+                    before_hash=before_hash,
+                    primary_executor=lambda: self.desktop.baidu_scholar_search(
+                        args["text"], page_key=page_key
+                    ),
                 ),
             )
             return self._normalize_browser_search_output(args["text"], raw_result)
@@ -275,7 +349,7 @@ class ActionAgent:
 
         # 视觉降级：仅在所有 DOM/ATSPI/直接策略都失败时使用
         if any(item.get("mode") == "visual" for item in attempt_plan):
-            if self.reasoning_model is not None and self.vision_model is not None:
+            if self.visual_fallback_enabled:
                 fallback_instruction = self._build_visual_operation_instruction(
                     kind=kind,
                     args=args,
@@ -308,59 +382,10 @@ class ActionAgent:
         if not page:
             return None
 
-        if kind == "browser.search":
+        if kind in ("browser.search", "scholar.baidu_search"):
             return None
 
-        if kind == "browser.search":
-            text = args.get("text", "")
-            if not text:
-                return None
-            # 从 DOM 元素中查找搜索输入框
-            search_input = None
-            for el in elements:
-                if el.get("role") == "input" and el.get("tag") in ("input", "textarea"):
-                    selector = el.get("selector", "")
-                    if selector:
-                        search_input = selector
-                        break
-            if not search_input:
-                # 降级到已知选择器
-                for sel in ["#kw", "#chat-textarea", "input[name='wd']", "textarea[name='wd']", "input[type='text']"]:
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=1000):
-                            search_input = sel
-                            break
-                    except Exception:
-                        continue
-
-            if search_input:
-                try:
-                    loc = page.locator(search_input).first
-                    await loc.click()
-                    await loc.fill("")
-                    await loc.type(text, delay=30)
-                    # 尝试点击搜索按钮
-                    search_btn = None
-                    for el in elements:
-                        if el.get("role") == "button" and any(
-                            kw in (el.get("name") or "").lower()
-                            for kw in ["搜索", "search", "baidu", "su", "提交"]
-                        ):
-                            btn_sel = el.get("selector", "")
-                            if btn_sel:
-                                search_btn = btn_sel
-                                break
-                    if search_btn:
-                        await page.locator(search_btn).first.click(timeout=3000)
-                    else:
-                        await page.keyboard.press("Enter")
-                    await asyncio.sleep(2)
-                    return {"text": text, "method": "dom_driven"}
-                except Exception:
-                    pass
-
-        elif kind == "browser.open":
+        if kind == "browser.open":
             url = args.get("url", "")
             if url and page:
                 try:
@@ -397,6 +422,32 @@ class ActionAgent:
             raise TaskExecutionError("Failed to open spreadsheet: {}".format(file_path))
         return {"opened": file_path}
 
+    @staticmethod
+    def _spreadsheet_cell_text_matches(expected: str, saved: str) -> bool:
+        """磁盘读回与期望文本比对；容忍 WPS/Excel 对引号、不间断空白的等价存储。"""
+        a = re.sub(r"\s+", " ", str(expected or "").strip())
+        b = re.sub(r"\s+", " ", str(saved or "").strip())
+        if a == b:
+            return True
+
+        def norm_quotes(s: str) -> str:
+            return (
+                s.replace("\u201c", '"')
+                .replace("\u201d", '"')
+                .replace("\u2018", "'")
+                .replace("\u2019", "'")
+                .replace("\xa0", " ")
+            )
+
+        na, nb = norm_quotes(a), norm_quotes(b)
+        if na == nb:
+            return True
+        # WPS/Excel 粘贴后常丢弃 ASCII 双引号（如标题「"博古问津":…」存成「博古问津:…」），读回与期望字面不一致。
+        def strip_ascii_double_quotes(s: str) -> str:
+            return re.sub(r'["＂]', "", s)
+
+        return strip_ascii_double_quotes(na) == strip_ascii_double_quotes(nb)
+
     async def _write_spreadsheet_cell(self, file_path: str, cell: str, text: str) -> Dict[str, Any]:
         success = self.desktop.wps_input_cell(cell, text)
         if not success:
@@ -431,11 +482,11 @@ class ActionAgent:
                 saved_text = ""
                 for _ in range(5):
                     saved_text = self.desktop.read_spreadsheet_cell(file_path, cell)
-                    if str(saved_text).strip() == expected_text:
+                    if self._spreadsheet_cell_text_matches(expected_text, saved_text):
                         break
                     await asyncio.sleep(0.6)
                 verification = {"mode": "single_cell", "saved_text": saved_text}
-                if str(saved_text).strip() != expected_text:
+                if not self._spreadsheet_cell_text_matches(expected_text, saved_text):
                     raise TaskExecutionError(
                         "Spreadsheet cell {} content mismatch after save. Expected '{}', got '{}'.".format(
                             cell,
@@ -516,6 +567,87 @@ class ActionAgent:
             "subject": subject,
             "body": body,
             "attachments": attachments,
+        }
+
+    @staticmethod
+    def _assignment_owner_allowlist_from_extracted(extracted: Dict[str, Any]) -> Optional[Set[str]]:
+        """用户指令里显式写出的「姓名=邮箱」映射的姓名集合；非空时发信仅限这些人，避免向未指定的发言人发信。"""
+        raw = extracted.get("email_map")
+        if not isinstance(raw, dict) or not raw:
+            return None
+        owners = {str(k).strip() for k in raw.keys() if str(k).strip()}
+        return owners or None
+
+    async def _send_meeting_assignments(self, extracted: Dict[str, Any], page_key: str = "") -> Dict[str, Any]:
+        workflow = MeetingWorkflow(provider=self.reasoning_model, artifact_root=self.artifact_dir)
+        assignments = workflow._normalize_assignments(
+            extracted.get("assignments", []),
+            extracted.get("email_map", {}),
+        )
+        allow_owners = self._assignment_owner_allowlist_from_extracted(extracted)
+        if allow_owners is not None:
+            assignments = [a for a in assignments if str(a.get("owner", "") or "").strip() in allow_owners]
+        if not assignments:
+            raise TaskExecutionError(
+                "在应用你提供的收件人名单后，没有可发送的会议任务分配条目。"
+                "若仍需给其他人发信，请补充「姓名=邮箱」映射；若会议里还有其他人仅有待办但未要求发信，可忽略。"
+            )
+
+        results = []
+        for assignment in assignments:
+            owner = str(assignment.get("owner", "") or "").strip()
+            email = str(assignment.get("email", "") or "").strip()
+            if not email:
+                raise TaskClarificationRequired(
+                    "会议任务邮件仍缺少「{}」的邮箱。"
+                    "请用一行或多行补充，例如「{}=zhangsan@example.com」；若此人不需要发信，请说明「不发给{}」。".format(
+                        owner or "某位负责人",
+                        owner or "姓名",
+                        owner or "此人",
+                    )
+                )
+            subject = str(
+                assignment.get("mail_subject", "")
+                or workflow._build_mail_subject(
+                    str(extracted.get("meeting_title", "") or ""),
+                    owner,
+                    has_tasks=bool(assignment.get("tasks")),
+                )
+            )
+            body = str(
+                assignment.get("mail_body", "")
+                or workflow._build_mail_body(
+                    meeting_title=str(extracted.get("meeting_title", "") or ""),
+                    meeting_date=str(extracted.get("meeting_date", "") or ""),
+                    source_url=workflow._clean_source_url(str(extracted.get("source_url", "") or "")),
+                    overall_summary=str(extracted.get("overall_summary", "") or ""),
+                    assignment=assignment,
+                )
+            )
+            success = await self.desktop.browser_send(
+                email,
+                subject=subject,
+                body=body,
+                attachments=[],
+                page_key=page_key,
+                authorize_before_send=self.authorization_callback,
+            )
+            if not success:
+                raise TaskExecutionError("Failed to send meeting assignment email for {}.".format(owner or email))
+            results.append(
+                {
+                    "owner": owner,
+                    "email": email,
+                    "subject": subject,
+                    "status": "sent",
+                }
+            )
+
+        return {
+            "delivery_mode": "browser",
+            "sent_count": len(results),
+            "preview_count": 0,
+            "results": results,
         }
 
     def _normalize_browser_search_output(self, query: str, raw_result: Any) -> Dict[str, Any]:
@@ -659,6 +791,10 @@ class ActionAgent:
             return "Open browser {}".format(args.get("url", "https://www.baidu.com"))
         if kind == "browser.search":
             return "Search browser for {}".format(args.get("text", ""))
+        if kind == "scholar.baidu_search":
+            return "Search Baidu Scholar for {}".format(args.get("text", ""))
+        if kind == "research.collect_literature":
+            return "Collect research literature and write spreadsheet"
         if kind == "browser.send":
             return "Send browser message to {}".format(args.get("to", "")).strip()
         if kind == "spreadsheet.open":
@@ -696,7 +832,7 @@ class ActionAgent:
 
     def _resolve_text_from_args_or_operation(self, args: Dict[str, Any], context: ExecutionContext) -> str:
         """从 args['text'] 或 from_operation 前序操作结果获取文本。
-        支持 browser.search → filesystem.write_cell / spreadsheet.write_cell 的结果传递。"""
+        支持 browser.search / scholar.baidu_search → filesystem.write_cell / spreadsheet.write_cell 的结果传递。"""
         text = args.get("text")
         reference = self._parse_operation_reference(text)
         source_op_id = reference.get("source_id") or args.get("from_operation")
@@ -1032,7 +1168,7 @@ class ActionAgent:
 
     def _validate_execution(self, kind: str, before_hash: str, output: Any, args: Dict[str, Any]) -> None:
         wait_seconds = 0.0
-        if kind in ("browser.open", "browser.search", "command.run"):
+        if kind in ("browser.open", "browser.search", "scholar.baidu_search", "command.run"):
             wait_seconds = 1.2
         elif kind in ("spreadsheet.open",):
             wait_seconds = 0.5
@@ -1113,7 +1249,7 @@ class ActionAgent:
                 raise TaskExecutionError("Browser open did not produce a detectable state change.")
             return
 
-        if kind == "browser.search":
+        if kind in ("browser.search", "scholar.baidu_search"):
             if not screen_changed and str(output).strip() != "搜索完成":
                 raise TaskExecutionError("Browser search did not produce a detectable state change.")
             return

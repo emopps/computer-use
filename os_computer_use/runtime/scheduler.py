@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from os_computer_use.agents.intent import TaskClarificationRequired
 from os_computer_use.runtime.task_models import OperationResult, OperationStatus
 
 
@@ -64,6 +65,37 @@ class DAGScheduler:
         for node_id in self.nodes:
             visit(node_id)
 
+    def _cascade_dependency_failures_to_pending(self) -> None:
+        """将 FAILED/BLOCKED 依赖传播到仍为 PENDING 的后代（多轮直至不动），避免单遍 list 推导漏标 BLOCKED。"""
+        changed = True
+        while changed:
+            changed = False
+            for node in self.nodes.values():
+                if node.status != OperationStatus.PENDING:
+                    continue
+                for dependency in node.dependencies:
+                    dep = self.nodes[dependency]
+                    if dep.status == OperationStatus.FAILED:
+                        node.status = OperationStatus.BLOCKED
+                        node.error = f"Dependency failed: {dependency}"
+                        self.results[node.node_id] = OperationResult(
+                            operation_id=node.node_id,
+                            status=OperationStatus.BLOCKED,
+                            error=node.error,
+                        )
+                        changed = True
+                        break
+                    if dep.status == OperationStatus.BLOCKED:
+                        node.status = OperationStatus.BLOCKED
+                        node.error = f"Dependency blocked: {dependency}"
+                        self.results[node.node_id] = OperationResult(
+                            operation_id=node.node_id,
+                            status=OperationStatus.BLOCKED,
+                            error=node.error,
+                        )
+                        changed = True
+                        break
+
     async def execute_all(
         self, executor: Callable[[SchedulerNode], Awaitable[Any]]
     ) -> Dict[str, OperationResult]:
@@ -71,6 +103,7 @@ class DAGScheduler:
         pending = set(self.nodes.keys())
 
         while pending:
+            self._cascade_dependency_failures_to_pending()
             blocked_now = [node_id for node_id in list(pending) if self.nodes[node_id].status == OperationStatus.BLOCKED]
             for node_id in blocked_now:
                 pending.remove(node_id)
@@ -78,7 +111,7 @@ class DAGScheduler:
                 break
             ready = [
                 self.nodes[node_id]
-                for node_id in list(pending)
+                for node_id in sorted(pending)
                 if self._dependencies_completed(node_id)
             ]
             blocked_now = [node_id for node_id in list(pending) if self.nodes[node_id].status == OperationStatus.BLOCKED]
@@ -99,9 +132,11 @@ class DAGScheduler:
                     "No runnable nodes remain; current node states: {}".format(failures)
                 )
 
-            batch_results = await asyncio.gather(
-                *(self._run_node(node, executor) for node in ready)
-            )
+            # 串行执行 ready：避免多个 spreadsheet.write_cell 并行触发 WPS/COM 竞态；
+            # 顺序按 node_id 稳定排序，与任务规划顺序一致。
+            batch_results: List[OperationResult] = []
+            for node in sorted(ready, key=lambda n: n.node_id):
+                batch_results.append(await self._run_node(node, executor))
             for result in batch_results:
                 self.results[result.operation_id] = result
                 pending.remove(result.operation_id)
@@ -115,6 +150,17 @@ class DAGScheduler:
             if dep_node.status == OperationStatus.FAILED:
                 node.status = OperationStatus.BLOCKED
                 node.error = f"Dependency failed: {dependency}"
+                self.results[node.node_id] = OperationResult(
+                    operation_id=node.node_id,
+                    status=OperationStatus.BLOCKED,
+                    error=node.error,
+                )
+                return False
+            # 与 FAILED 相同：若依赖已被标记为 BLOCKED（且可能已从 pending 中移除），
+            # 子节点必须同步阻塞，否则子节点会永远 PENDING，ready 为空触发 SchedulerError。
+            if dep_node.status == OperationStatus.BLOCKED:
+                node.status = OperationStatus.BLOCKED
+                node.error = f"Dependency blocked: {dependency}"
                 self.results[node.node_id] = OperationResult(
                     operation_id=node.node_id,
                     status=OperationStatus.BLOCKED,
@@ -140,6 +186,12 @@ class DAGScheduler:
                 status=OperationStatus.COMPLETED,
                 output=node.result,
             )
+        except TaskClarificationRequired:
+            raise
+        except asyncio.CancelledError:
+            node.error = "cancelled"
+            node.status = OperationStatus.FAILED
+            raise
         except Exception as exc:
             node.error = str(exc)
             node.status = OperationStatus.FAILED

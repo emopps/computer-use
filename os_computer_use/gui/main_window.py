@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import QObject, QPoint, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QFontMetrics
@@ -34,6 +34,9 @@ Signal = pyqtSignal
 
 from os_computer_use.app_runtime import ensure_supported_python
 from os_computer_use.gui.worker import AgentWorker
+
+# 内联 HTML 片段标记：与连续正文合并时区分命令条（Qt RichText 不显示该注释）。
+STREAM_CMD_HTML_MARK = "<!--ocu-cmd-->"
 
 
 def configure_linux_input_method() -> None:
@@ -66,6 +69,48 @@ def configure_linux_input_method() -> None:
     os.environ["XMODIFIERS"] = os.environ.get("XMODIFIERS", "@im=fcitx") or "@im=fcitx"
 
 
+def _authorization_should_collapse_details(action_type: str, details: str) -> bool:
+    raw = str(details or "").strip()
+    if not raw:
+        return False
+    if str(action_type or "").strip() == "browser.send" and "{" in raw:
+        return len(raw) > 80
+    if "\n" in raw or "\r" in raw:
+        return len(raw) > 60
+    return len(raw) > 200
+
+
+def _authorization_summary_text(action_type: str, details: str) -> str:
+    """授权卡片折叠态：突出收件人、主题等，便于录屏与扫读。"""
+    raw = str(details or "").strip()
+    if not raw:
+        return "\uff08\u65e0\u8be6\u60c5\uff09"
+    if str(action_type or "").strip() == "browser.send":
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                lines = []
+                to = str(payload.get("to", "") or "").strip()
+                subj = str(payload.get("subject", "") or "").strip()
+                if to:
+                    lines.append("\u6536\u4ef6\u4eba\uff1a{}".format(to))
+                if subj:
+                    if len(subj) > 140:
+                        subj = subj[:140] + "\u2026"
+                    lines.append("\u4e3b\u9898\uff1a{}".format(subj))
+                att = payload.get("attachment_count")
+                if att is not None:
+                    lines.append("\u9644\u4ef6\u6570\uff1a{}".format(att))
+                if lines:
+                    return "\n".join(lines)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    first = raw.replace("\r\n", "\n").split("\n", 1)[0].strip()
+    if len(first) > 160:
+        first = first[:160] + "\u2026"
+    return first
+
+
 class WorkerBridge(QObject):
     warmup_requested = Signal()
     process_prompt = Signal(str)
@@ -79,8 +124,8 @@ class UserBubble(QFrame):
         super().__init__()
         self.setObjectName("userBubble")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 14)
-        layout.setSpacing(6)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(4)
 
         title = QLabel("\u7528\u6237")
         title.setObjectName("userTitle")
@@ -91,9 +136,27 @@ class UserBubble(QFrame):
         body.setTextFormat(Qt.RichText)
         body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setContentsMargins(0, 0, 0, 0)
 
         layout.addWidget(title)
         layout.addWidget(body)
+
+
+def _stream_resolution_after_authorization(stream: List[Dict[str, Any]], auth_index: int) -> Optional[bool]:
+    """在流式块序列中，authorization 块之后若出现「已允许/已拒绝」的 html，则返回 True/False；否则 None（仍待处理）。"""
+    allowed_marker = "\u5df2\u5141\u8bb8\u7ee7\u7eed\u3002"
+    rejected_marker = "\u5df2\u62d2\u7edd\u8fd9\u4e00\u6b65\u3002"
+    for j in range(auth_index + 1, len(stream)):
+        typ = str(stream[j].get("type", "") or "")
+        if typ == "authorization":
+            return None
+        if typ == "html":
+            blob = str(stream[j].get("html", "") or "")
+            if allowed_marker in blob:
+                return True
+            if rejected_marker in blob:
+                return False
+    return None
 
 
 class AssistantCard(QFrame):
@@ -107,17 +170,19 @@ class AssistantCard(QFrame):
         self._operation_rows: Dict[str, OperationStatusRow] = {}
         self._operation_snapshots: List[Dict[str, str]] = []
         self._stream_snapshots: List[Dict[str, str]] = []
+        self._stream_merge_label: Optional[QLabel] = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(4)
 
         self.name_label = QLabel("\u684c\u9762\u667a\u80fd\u4f53")
         self.name_label.setObjectName("assistantName")
         self.stream_wrap = QWidget()
+        self.stream_wrap.setObjectName("assistantStreamHost")
         self.stream_layout = QVBoxLayout(self.stream_wrap)
         self.stream_layout.setContentsMargins(0, 0, 0, 0)
-        self.stream_layout.setSpacing(8)
+        self.stream_layout.setSpacing(0)
         self.stream_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.meta_label = QLabel("\u6267\u884c\u52a8\u4f5c\u4f1a\u9ad8\u4eae\u663e\u793a")
@@ -131,43 +196,106 @@ class AssistantCard(QFrame):
         layout.addWidget(self.stream_wrap)
         layout.addWidget(self.meta_label)
 
-    def _append_block(self, widget: QWidget) -> None:
-        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._stream_blocks.append(widget)
-        self.stream_layout.addWidget(widget)
+    def _break_stream_body_merge(self) -> None:
+        """下一块非连续正文（命令条、操作行、授权卡等）前结束合并。"""
+        self._stream_merge_label = None
 
-    def _append_html_line(self, html_text: str) -> None:
+    @staticmethod
+    def _is_command_html_fragment(html_fragment: str) -> bool:
+        if STREAM_CMD_HTML_MARK in html_fragment:
+            return True
+        lf = html_fragment.lower()
+        return "display:inline-block" in lf and "border-radius:999px" in lf
+
+    @staticmethod
+    def _body_fragment_to_flow_span(html_fragment: str) -> str:
+        """把正文块改为行内 span，避免多个块级 div 在 Qt RichText 里产生额外段距。"""
+        raw = str(html_fragment or "").strip()
+        if not raw:
+            return raw
+        if raw.startswith("<span") and raw.endswith("</span>"):
+            return raw
+        m = re.match(r'^<div\s+style="([^"]*)"\s*>(.*)</div>\s*$', raw, re.DOTALL)
+        if not m:
+            return raw
+        style, inner = m.group(1), m.group(2)
+        kept: List[str] = []
+        for p in (x.strip() for x in style.split(";") if x.strip()):
+            pl = p.lower()
+            if pl.startswith("color:") or pl.startswith("font-weight:"):
+                kept.append(p)
+        if not any(x.lower().startswith("color:") for x in kept):
+            kept.insert(0, "color:#26251e")
+        return '<span style="{}">{}</span>'.format(";".join(kept), inner)
+
+    def _append_body_html_fragment(self, html_fragment: str) -> None:
+        """连续 append_text 合并到同一 QLabel；正文用 span + <br/>，行距与用户单段一致。"""
+        display_html = (
+            html_fragment.replace(STREAM_CMD_HTML_MARK, "", 1)
+            if STREAM_CMD_HTML_MARK in html_fragment
+            else html_fragment
+        )
+        if self._is_command_html_fragment(html_fragment):
+            self._break_stream_body_merge()
+            label = QLabel()
+            label.setObjectName("assistantBody")
+            label.setWordWrap(True)
+            label.setTextFormat(Qt.RichText)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setContentsMargins(0, 0, 0, 0)
+            label.setText(display_html)
+            self._append_block(label)
+            return
+        piece = self._body_fragment_to_flow_span(html_fragment)
+        if (
+            self._stream_merge_label is not None
+            and self._stream_blocks
+            and self._stream_blocks[-1] is self._stream_merge_label
+        ):
+            cur = self._stream_merge_label.text()
+            self._stream_merge_label.setText(
+                (cur + "<br/>" + piece) if cur.strip() else piece
+            )
+            return
         label = QLabel()
         label.setObjectName("assistantBody")
         label.setWordWrap(True)
         label.setTextFormat(Qt.RichText)
         label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setText(html_text)
+        label.setContentsMargins(0, 0, 0, 0)
+        label.setText(piece)
+        self._stream_merge_label = label
         self._append_block(label)
+
+    def _append_block(self, widget: QWidget) -> None:
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._stream_blocks.append(widget)
+        self.stream_layout.addWidget(widget)
 
     def append_text(self, text: str, color: str = "default") -> None:
         text = text.strip()
         if not text:
             return
         palette = {
-            "default": "#364152",
-            "muted": "#5d6b7c",
-            "cyan": "#2d86eb",
-            "green": "#1f8f5f",
-            "yellow": "#a36a00",
-            "red": "#d04f4f",
-            "gray": "#7b8596",
-            "blue": "#3f7cff",
-            "magenta": "#7b58d0",
+            "default": "#26251e",
+            "muted": "#807d72",
+            "cyan": "#3d5a80",
+            "green": "#1f8a65",
+            "yellow": "#8a6328",
+            "red": "#cf2d56",
+            "gray": "#a09c92",
+            "blue": "#3d5a80",
+            "magenta": "#6b5089",
         }
         safe = html.escape(text)
         html_text = (
-            f'<div style="color:{palette.get(color, "#364152")}; margin-bottom:6px; background:transparent; font-weight:500;">{safe}</div>'
+            f'<span style="color:{palette.get(color, "#26251e")}; font-weight:400;">{safe}</span>'
         )
         self._lines.append(html_text)
         self._lines = self._lines[-40:]
-        self._append_html_line(html_text)
+        self._append_body_html_fragment(html_text)
         self._stream_snapshots.append({"type": "html", "html": html_text})
 
     def add_command(self, text: str, tone: str = "run") -> None:
@@ -177,26 +305,28 @@ class AssistantCard(QFrame):
         self._command_keys.add(key)
         self._commands.append((text, tone))
         palette = {
-            "run": ("#0d7a5f", "#eefaf5", "#cbeee1"),
-            "done": ("#1d64d6", "#f1f6ff", "#d5e4ff"),
-            "warn": ("#a45a00", "#fff6e6", "#f2ddb3"),
+            "run": ("#425466", "#f5f7fb", "#dbe3ef"),
+            "done": ("#0f6b4b", "#eef8f3", "#b9e1cd"),
+            "warn": ("#b42318", "#fff5f4", "#f3c4bf"),
         }
-        fg, bg, border = palette.get(tone, palette["run"])
+        fg, bg, bd = palette.get(tone, palette["run"])
         safe = html.escape(text.strip())
         html_text = (
-            '<div style="margin:8px 0 10px 0;">'
+            STREAM_CMD_HTML_MARK
+            + '<div style="margin:6px 0 4px 0;">'
             f'<span style="display:inline-block; color:{fg}; background:{bg}; '
-            f'border:1px solid {border}; border-radius:14px; padding:10px 14px; font-weight:700;">{safe}</span>'
+            f'border:1px solid {bd}; border-radius:10px; padding:8px 12px; font-weight:500; font-size:15px; line-height:1.45;">{safe}</span>'
             "</div>"
         )
         self._lines.append(html_text)
         self._lines = self._lines[-60:]
-        self._append_html_line(html_text)
+        self._append_body_html_fragment(html_text)
         self._stream_snapshots.append({"type": "html", "html": html_text})
 
     def upsert_operation(self, operation_id: str, label: str, status: str) -> None:
         row = self._operation_rows.get(operation_id)
         if row is None:
+            self._break_stream_body_merge()
             row = OperationStatusRow(label)
             self._operation_rows[operation_id] = row
             self._append_block(row)
@@ -221,12 +351,40 @@ class AssistantCard(QFrame):
         self.meta_label.setVisible(bool(str(text).strip()))
 
     def add_inline_widget(self, widget: QWidget) -> None:
+        self._break_stream_body_merge()
         self._append_block(widget)
+
+    def record_authorization_pending(self, action_type: str, details: str) -> None:
+        """与内联 AuthorizationCard 同步写入流快照，避免切换会话/重绘时仅存文本而丢失授权块。"""
+        self._stream_snapshots.append(
+            {
+                "type": "authorization",
+                "action_type": str(action_type or ""),
+                "details": str(details or ""),
+            }
+        )
+
+    def pending_authorization_from_stream(self) -> Optional[Dict[str, str]]:
+        """从流快照推断尚未在流中出现「已允许/已拒绝」跟进的最后一次授权请求。"""
+        auth_idx: Optional[int] = None
+        action_type = ""
+        detail_text = ""
+        for i, item in enumerate(self._stream_snapshots):
+            if str(item.get("type", "") or "") == "authorization":
+                auth_idx = i
+                action_type = str(item.get("action_type", "") or "")
+                detail_text = str(item.get("details", "") or "")
+        if auth_idx is None:
+            return None
+        if _stream_resolution_after_authorization(self._stream_snapshots, auth_idx) is not None:
+            return None
+        return {"action_type": action_type, "details": detail_text}
 
     def restore_lines(self, lines: List[str]) -> None:
         self._lines = list(lines)
+        self._break_stream_body_merge()
         for html_text in self._lines:
-            self._append_html_line(html_text)
+            self._append_body_html_fragment(html_text)
 
     def restore_operations(self, operations: List[Dict[str, str]]) -> None:
         for item in operations:
@@ -248,16 +406,18 @@ class AssistantCard(QFrame):
         self._lines = []
         self._operation_snapshots = []
         self._operation_rows = {}
-        for item in stream:
+        self._break_stream_body_merge()
+        for i, item in enumerate(stream):
             item_type = str(item.get("type", "") or "")
             if item_type == "html":
                 html_text = str(item.get("html", "") or "")
                 if not html_text:
                     continue
                 self._lines.append(html_text)
-                self._append_html_line(html_text)
+                self._append_body_html_fragment(html_text)
                 self._stream_snapshots.append({"type": "html", "html": html_text})
             elif item_type == "operation":
+                self._break_stream_body_merge()
                 op_id = str(item.get("id", "") or "")
                 label = str(item.get("label", "") or "")
                 status = str(item.get("status", "") or "")
@@ -270,6 +430,16 @@ class AssistantCard(QFrame):
                 snapshot = {"id": op_id, "label": label, "status": status}
                 self._operation_snapshots.append(snapshot)
                 self._stream_snapshots.append({"type": "operation", **snapshot})
+            elif item_type == "authorization":
+                action_type = str(item.get("action_type", "") or "")
+                detail_text = str(item.get("details", "") or "")
+                self._stream_snapshots.append(
+                    {"type": "authorization", "action_type": action_type, "details": detail_text}
+                )
+                resolved = _stream_resolution_after_authorization(stream, i)
+                if resolved is True or resolved is False:
+                    self._break_stream_body_merge()
+                    self._append_block(AuthorizationCard(action_type, detail_text, None, resolved=resolved))
 
 
 class OperationStatusRow(QFrame):
@@ -283,29 +453,42 @@ class OperationStatusRow(QFrame):
         self._timer.timeout.connect(self._tick)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(12)
+
+        self.rail = QFrame()
+        self.rail.setObjectName("operationRail")
+        self.rail.setFixedWidth(3)
 
         self.dot = QLabel()
         self.dot.setObjectName("operationDot")
-        self.dot.setFixedSize(8, 8)
+        self.dot.setFixedSize(10, 10)
 
         self.title = QLabel(label)
         self.title.setObjectName("operationTitle")
+        self.title.setWordWrap(True)
 
         self.status_label = QLabel()
         self.status_label.setObjectName("operationStatus")
-        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setMinimumWidth(112)
+        self.status_label.setMinimumHeight(38)
 
-        layout.addWidget(self.dot, 0, Qt.AlignTop)
-        layout.addWidget(self.title, 1)
-        layout.addWidget(self.status_label, 0, Qt.AlignRight)
+        leading_wrap = QHBoxLayout()
+        leading_wrap.setContentsMargins(0, 0, 0, 0)
+        leading_wrap.setSpacing(10)
+        leading_wrap.addWidget(self.dot, 0, Qt.AlignVCenter)
+        leading_wrap.addWidget(self.title, 1, Qt.AlignVCenter)
+
+        layout.addWidget(self.rail, 0)
+        layout.addLayout(leading_wrap, 1)
+        layout.addWidget(self.status_label, 0, Qt.AlignVCenter)
 
     def _tick(self) -> None:
         if self._running_since <= 0:
             return
         self._last_elapsed = max(0, int(time.monotonic() - self._running_since))
-        self.status_label.setText("Running {}s".format(self._last_elapsed))
+        self.status_label.setText("\u6267\u884c\u4e2d {}s".format(self._last_elapsed))
 
     def set_status(self, status: str) -> None:
         if status == "running":
@@ -314,65 +497,154 @@ class OperationStatusRow(QFrame):
                 self._last_elapsed = 0
             if not self._timer.isActive():
                 self._timer.start()
-            self.status_label.setText("Running 0s")
+            self.status_label.setText("\u6267\u884c\u4e2d 0s")
             self.setProperty("state", "running")
         elif status == "completed":
             elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else self._last_elapsed
             self._last_elapsed = elapsed
             self._timer.stop()
             self._running_since = 0.0
-            self.status_label.setText("Finished {}s".format(elapsed))
+            self.status_label.setText("\u5df2\u5b8c\u6210 {}s".format(elapsed))
             self.setProperty("state", "completed")
         else:
             self._timer.stop()
             elapsed = max(0, int(time.monotonic() - self._running_since)) if self._running_since > 0 else self._last_elapsed
             self._last_elapsed = elapsed
             self._running_since = 0.0
-            self.status_label.setText("Failed {}s".format(elapsed) if elapsed else "Failed")
+            self.status_label.setText("\u5931\u8d25 {}s".format(elapsed) if elapsed else "\u5931\u8d25")
             self.setProperty("state", "failed")
         self.style().unpolish(self)
         self.style().polish(self)
 
 
 class AuthorizationCard(QFrame):
-    def __init__(self, action_type: str, details: str, on_decide) -> None:
+    """高风险操作确认卡片；支持交互确认与历史只读展示（恢复会话时保留）。"""
+
+    def __init__(
+        self,
+        action_type: str,
+        details: str,
+        on_decide: Optional[Callable[[bool], None]],
+        *,
+        resolved: Optional[bool] = None,
+    ) -> None:
         super().__init__()
         self.setObjectName("authorizationCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setSpacing(8)
 
-        title = QLabel("\u9700\u8981\u786e\u8ba4")
-        title.setObjectName("assistantName")
+        self._title_label = QLabel()
+        self._title_label.setObjectName("assistantName")
 
         body = QLabel("\u68c0\u6d4b\u5230\u9ad8\u98ce\u9669\u64cd\u4f5c\uff0c\u8bf7\u786e\u8ba4\u662f\u5426\u7ee7\u7eed\u3002")
+        if resolved is not None:
+            body.setText("\u5df2\u8bb0\u5f55\u7684\u9ad8\u98ce\u9669\u64cd\u4f5c\uff08\u5386\u53f2\u786e\u8ba4\u72b6\u6001\uff09\u3002")
         body.setObjectName("assistantBody")
         body.setWordWrap(True)
 
-        detail = QLabel("\u64cd\u4f5c\u7c7b\u578b\uff1a{}\n\u8be6\u60c5\uff1a{}".format(action_type, details))
-        detail.setObjectName("assistantMeta")
-        detail.setWordWrap(True)
-        detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        type_heading = QLabel("\u64cd\u4f5c\u7c7b\u578b\uff1a{}".format(action_type or ""))
+        type_heading.setObjectName("monoDetail")
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
+        self._toggle_btn: Optional[QPushButton] = None
+        self._full_detail_label: Optional[QLabel] = None
+        self._simple_detail_label: Optional[QLabel] = None
+        self._expanded = False
+
+        raw_details = str(details or "").strip()
+        if _authorization_should_collapse_details(action_type, details):
+            summary = QLabel(_authorization_summary_text(action_type, details))
+            summary.setObjectName("assistantBody")
+            summary.setWordWrap(True)
+            self._full_detail_label = QLabel(
+                "\u8be6\u60c5\uff08\u5168\u6587\uff09\uff1a\n{}".format(details if raw_details else "\uff08\u65e0\uff09")
+            )
+            self._full_detail_label.setObjectName("monoDetail")
+            self._full_detail_label.setWordWrap(True)
+            self._full_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self._full_detail_label.hide()
+            self._toggle_btn = QPushButton("\u5c55\u5f00\u8be6\u60c5")
+            self._toggle_btn.setObjectName("expandDetailButton")
+            self._toggle_btn.setFlat(True)
+            self._toggle_btn.setCursor(Qt.PointingHandCursor)
+            self._toggle_btn.clicked.connect(self._toggle_detail_expanded)
+        else:
+            single = QLabel(
+                "\u8be6\u60c5\uff1a{}".format(details if raw_details else "\uff08\u65e0\uff09")
+            )
+            single.setObjectName("monoDetail")
+            single.setWordWrap(True)
+            single.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self._simple_detail_label = single
+
+        self._button_bar = QWidget()
+        bl = QHBoxLayout(self._button_bar)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(8)
         reject = QPushButton("\u62d2\u7edd")
         reject.setObjectName("minorButton")
         reject.setMinimumHeight(34)
         approve = QPushButton("\u5141\u8bb8")
         approve.setObjectName("sendButton")
         approve.setMinimumHeight(34)
-        reject.clicked.connect(lambda: on_decide(False))
-        approve.clicked.connect(lambda: on_decide(True))
-        buttons.addWidget(reject)
-        buttons.addWidget(approve)
-        buttons.addStretch(1)
+        if resolved is None and on_decide is not None:
+            reject.clicked.connect(lambda: on_decide(False))
+            approve.clicked.connect(lambda: on_decide(True))
+        bl.addWidget(reject)
+        bl.addWidget(approve)
+        bl.addStretch(1)
 
-        layout.addWidget(title)
+        self._result_label = QLabel()
+        self._result_label.setObjectName("assistantBody")
+        self._result_label.setWordWrap(True)
+        self._result_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._result_label.hide()
+
+        layout.addWidget(self._title_label)
         layout.addWidget(body)
-        layout.addWidget(detail)
-        layout.addLayout(buttons)
+        layout.addWidget(type_heading)
+        if self._toggle_btn is not None:
+            layout.addWidget(summary)
+            layout.addWidget(self._toggle_btn)
+            layout.addWidget(self._full_detail_label)
+        else:
+            layout.addWidget(self._simple_detail_label)
+        layout.addWidget(self._button_bar)
+        layout.addWidget(self._result_label)
+
+        if resolved is True:
+            self._title_label.setText("\u5df2\u5141\u8bb8")
+            self._apply_resolved_state(True, update_title=False)
+        elif resolved is False:
+            self._title_label.setText("\u5df2\u62d2\u7edd")
+            self._apply_resolved_state(False, update_title=False)
+        else:
+            self._title_label.setText("\u9700\u8981\u786e\u8ba4")
+
+    def apply_resolved(self, allowed: bool) -> None:
+        """用户点击允许/拒绝后的即时视觉反馈。"""
+        self._apply_resolved_state(allowed, update_title=True)
+
+    def _apply_resolved_state(self, allowed: bool, *, update_title: bool) -> None:
+        self._button_bar.hide()
+        text = "\u5df2\u5141\u8bb8\u7ee7\u7eed\u3002" if allowed else "\u5df2\u62d2\u7edd\u8fd9\u4e00\u6b65\u3002"
+        self._result_label.setText(text)
+        self._result_label.show()
+        self.setProperty("state", "resolved_allow" if allowed else "resolved_deny")
+        if update_title:
+            self._title_label.setText("\u5df2\u5141\u8bb8" if allowed else "\u5df2\u62d2\u7edd")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _toggle_detail_expanded(self) -> None:
+        if self._full_detail_label is None or self._toggle_btn is None:
+            return
+        self._expanded = not self._expanded
+        self._full_detail_label.setVisible(self._expanded)
+        self._toggle_btn.setText(
+            "\u6536\u8d77\u8be6\u60c5" if self._expanded else "\u5c55\u5f00\u8be6\u60c5"
+        )
 
 
 class MainWindow(QMainWindow):
@@ -422,11 +694,15 @@ class MainWindow(QMainWindow):
         self._pending_input_mode = ""
         self._active_authorization_card: Optional[AuthorizationCard] = None
         self._pending_authorization: Optional[Dict[str, str]] = None
+        self._worker_conversation_button: Optional[QPushButton] = None
         self._running = False
         self._warmup_ready = False
         self._clarification_resume_active = False
         self._seen_operation_states: Set[Tuple[str, str]] = set()
         self._plan_cycle = 0
+        # 主聊天区：用户离开底部则暂停自动滚到底，回到底部附近恢复（类似 Claude 网页）。
+        self._chat_follow_tail = True
+        self._chat_scroll_programmatic = False
         self._status_base_message = "正在启动并预加载模型..."
         self._status_started_at = 0.0
         self._status_timer = QTimer(self)
@@ -468,6 +744,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget(self)
+        root.setObjectName("appRoot")
         self.setCentralWidget(root)
 
         page = QHBoxLayout(root)
@@ -476,10 +753,10 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(156)
+        sidebar.setFixedWidth(176)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(18, 22, 18, 18)
-        sidebar_layout.setSpacing(14)
+        sidebar_layout.setContentsMargins(14, 20, 14, 18)
+        sidebar_layout.setSpacing(12)
 
         self.new_chat_button = QPushButton("新建对话")
         self.new_chat_button.setObjectName("newChatButton")
@@ -490,6 +767,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(current_label)
 
         self.current_conversation_host = QWidget()
+        self.current_conversation_host.setObjectName("sidebarStackHost")
         self.current_conversation_host.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self.current_conversation_layout = QVBoxLayout(self.current_conversation_host)
         self.current_conversation_layout.setContentsMargins(0, 0, 0, 0)
@@ -501,10 +779,12 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(history_label)
 
         self.history_scroll = QScrollArea()
+        self.history_scroll.setFrameShape(QFrame.NoFrame)
         self.history_scroll.setWidgetResizable(True)
         self.history_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.history_scroll.setObjectName("historyScroll")
         self.conversation_list = QWidget()
+        self.conversation_list.setObjectName("sidebarStackHost")
         self.conversation_list_layout = QVBoxLayout(self.conversation_list)
         self.conversation_list_layout.setContentsMargins(0, 0, 0, 0)
         self.conversation_list_layout.setSpacing(10)
@@ -514,33 +794,43 @@ class MainWindow(QMainWindow):
         page.addWidget(sidebar)
 
         main = QWidget()
+        main.setObjectName("mainPanel")
         main_layout = QVBoxLayout(main)
-        main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(14)
+        main_layout.setContentsMargins(24, 20, 24, 20)
+        main_layout.setSpacing(16)
         page.addWidget(main, 1)
 
         hero = QLabel("Open Computer Use")
         hero.setObjectName("heroTitle")
         hero.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        hero_sub = QLabel("\u672c\u5730\u684c\u9762\u81ea\u52a8\u5316 \u00b7 \u81ea\u7136\u8bed\u8a00\u4ea4\u4e92")
+        hero_sub.setObjectName("heroSubtitle")
+        hero_sub.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         main_layout.addWidget(hero)
+        main_layout.addWidget(hero_sub)
 
         self.chat_scroll = QScrollArea()
+        self.chat_scroll.setFrameShape(QFrame.NoFrame)
         self.chat_scroll.setWidgetResizable(True)
         self.chat_scroll.setObjectName("chatScroll")
         self.chat_host = QWidget()
+        self.chat_host.setObjectName("chatHost")
         self.chat_layout = QVBoxLayout(self.chat_host)
-        self.chat_layout.setContentsMargins(10, 8, 10, 8)
-        self.chat_layout.setSpacing(18)
+        self.chat_layout.setContentsMargins(0, 4, 0, 8)
+        self.chat_layout.setSpacing(20)
         self.chat_layout.setAlignment(Qt.AlignTop)
         self.chat_scroll.setWidget(self.chat_host)
+        chat_bar = self.chat_scroll.verticalScrollBar()
+        chat_bar.valueChanged.connect(self._on_chat_scroll_value_changed)
+        chat_bar.rangeChanged.connect(self._on_chat_scroll_range_changed)
         main_layout.addWidget(self.chat_scroll, 1)
 
         input_row = QHBoxLayout()
-        input_row.setSpacing(12)
+        input_row.setSpacing(10)
         self.prompt_edit = QLineEdit()
         self.prompt_edit.setObjectName("promptEdit")
         self.prompt_edit.setPlaceholderText("请输入您的问题或任务...")
-        self.prompt_edit.setMinimumHeight(54)
+        self.prompt_edit.setMinimumHeight(44)
         self.prompt_edit.setAttribute(Qt.WA_InputMethodEnabled, True)
         self.prompt_edit.setFocusPolicy(Qt.StrongFocus)
         self.prompt_edit.setInputMethodHints(Qt.ImhNone)
@@ -569,166 +859,266 @@ class MainWindow(QMainWindow):
         self.stop_button.clicked.connect(self._cancel_task)
         self.run_button.clicked.connect(self._run_task)
 
-        font = QFont("Microsoft YaHei UI")
+        font = QFont()
         font.setStyleStrategy(QFont.PreferAntialias)
         self.setFont(font)
 
         self.setStyleSheet(
             """
-            QMainWindow, QWidget {
-                background: #f7f9fc;
-                color: #303133;
-                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
-                             "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
-                font-size: 14px;
+            QMainWindow {
+                background: #f7f7f4;
+            }
+            QWidget {
+                color: #26251e;
+                font-family: "Inter", "IBM Plex Sans", system-ui, "Segoe UI",
+                             "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+                             "Noto Sans CJK SC", sans-serif;
+                font-size: 16px;
+            }
+            #appRoot, #mainPanel, #sidebar, #chatHost {
+                background: #f7f7f4;
             }
             QLabel {
                 background: transparent;
             }
+            #assistantStreamHost {
+                background: transparent;
+            }
+            #monoDetail {
+                font-family: "JetBrains Mono", "Cascadia Code", "Consolas", monospace;
+                font-size: 13px;
+                font-weight: 400;
+                color: #5a5852;
+                line-height: 1.5;
+            }
             #sidebar {
-                background: #fbfcfe;
-                border-right: 1px solid #e7ebf2;
+                background: #f7f7f4;
+                border-right: 1px solid #e6e5e0;
+            }
+            #sidebarStackHost {
+                background: transparent;
             }
             #sidebarSectionTitle {
-                color: #8a94a6;
-                font-size: 12px;
-                font-weight: 700;
-                padding: 4px 4px 0 4px;
+                color: #807d72;
+                font-size: 13px;
+                font-weight: 600;
+                padding: 8px 6px 2px 6px;
             }
             #newChatButton {
                 min-height: 40px;
-                border: none;
-                border-radius: 20px;
-                background: #3396f4;
-                color: white;
-                font-size: 15px;
-                font-weight: 700;
+                border: 1px solid #cfcdc4;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #26251e;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            #newChatButton:hover {
+                background: #fafaf7;
+                border-color: #807d72;
+            }
+            #newChatButton:pressed {
+                background: #efeee8;
             }
             QPushButton[conversation="true"] {
-                min-height: 38px;
-                max-height: 38px;
+                min-height: 40px;
+                max-height: 40px;
                 text-align: left;
-                padding: 0 14px;
-                border: none;
-                border-radius: 10px;
-                background: #eef4fb;
-                color: #4c596b;
-                font-size: 13px;
-                font-weight: 700;
+                padding: 0 12px;
+                border: 1px solid #e6e5e0;
+                border-radius: 8px;
+                background: #fafaf7;
+                color: #5a5852;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QPushButton[conversation="true"]:hover {
+                background: #efeee8;
+                color: #26251e;
             }
             QPushButton[conversation="true"][active="true"] {
-                background: #d9ebff;
-                color: #1f75d8;
+                background: #26251e;
+                color: #f7f7f4;
+                border: 1px solid #26251e;
             }
             QPushButton[conversation="true"][pinned="true"] {
-                border: 1px solid #9fcbff;
+                border: 1px solid #cfcdc4;
             }
             #historyScroll {
                 border: none;
                 background: transparent;
             }
             #heroTitle {
-                margin-top: 8px;
-                font-size: 21px;
-                font-weight: 800;
-                color: #2b2f36;
+                margin-top: 4px;
+                font-size: 22px;
+                font-weight: 400;
+                color: #26251e;
+            }
+            #heroSubtitle {
+                margin-top: -2px;
+                margin-bottom: 8px;
+                font-size: 16px;
+                font-weight: 400;
+                color: #5a5852;
             }
             #chatScroll {
                 border: none;
-                background: transparent;
+                background: #f7f7f4;
+            }
+            #chatScroll > QWidget > QWidget {
+                background: #f7f7f4;
+            }
+            #chatHost {
+                background: #f7f7f4;
             }
             #userBubble {
-                background: #eef6ff;
-                border-radius: 22px;
-                border: 1px solid #d6e9ff;
+                background: #ffffff;
+                border-radius: 12px;
+                border: 1px solid #e6e5e0;
             }
             #userTitle {
-                color: #2f9d46;
-                font-size: 14px;
-                font-weight: 800;
+                color: #807d72;
+                font-size: 16px;
+                font-weight: 600;
             }
             #userBody {
-                color: #2f3540;
-                font-size: 15px;
-                line-height: 1.55;
+                color: #5a5852;
+                font-size: 16px;
+                font-weight: 400;
+                line-height: 1.45;
+                margin: 0px;
+                padding: 0px;
             }
             #assistantCard {
-                background: white;
-                border-radius: 22px;
-                border: 1px solid #edf1f6;
+                background: #ffffff;
+                border-radius: 12px;
+                border: 1px solid #e6e5e0;
             }
             #authorizationCard {
-                background: #fff9ee;
-                border-radius: 18px;
-                border: 1px solid #f3ddab;
+                background: #fafaf7;
+                border-radius: 12px;
+                border: 1px solid #e6e5e0;
+            }
+            #authorizationCard[state="resolved_allow"] {
+                background: #fafaf7;
+                border: 1px solid #1f8a65;
+            }
+            #authorizationCard[state="resolved_deny"] {
+                background: #fafaf7;
+                border: 1px solid #cf2d56;
             }
             #assistantName {
-                color: #1773d1;
-                font-size: 15px;
-                font-weight: 800;
+                color: #26251e;
+                font-size: 16px;
+                font-weight: 600;
             }
             #assistantBody {
-                color: #364152;
-                font-size: 15px;
-                line-height: 1.6;
+                color: #5a5852;
+                font-size: 16px;
+                font-weight: 400;
+                line-height: 1.45;
+                margin: 0px;
+                padding: 0px;
             }
             #assistantMeta {
-                color: #6f7c8f;
+                color: #807d72;
                 font-size: 13px;
+                font-weight: 400;
             }
             #operationRow {
-                background: #f7fbff;
-                border: 1px solid #dce8f7;
+                background: #fcfcfa;
+                border: 1px solid #e6e9ef;
                 border-radius: 10px;
             }
             #operationRow[state="running"] {
-                border: 1px solid #b9dafc;
-                background: #eef7ff;
+                background: #f7faff;
+                border: 1px solid #d5e2f2;
             }
             #operationRow[state="completed"] {
-                border: 1px solid #cfe9da;
-                background: #f1fbf5;
+                background: #f7faf7;
+                border: 1px solid #d8e8de;
             }
             #operationRow[state="failed"] {
-                border: 1px solid #f0d4d4;
-                background: #fff4f4;
+                background: #fff7f6;
+                border: 1px solid #f0d0cb;
+            }
+            #operationRail {
+                background: #cfd7e6;
+                border-radius: 1px;
+            }
+            #operationRow[state="running"] #operationRail {
+                background: #7c9ecf;
+            }
+            #operationRow[state="completed"] #operationRail {
+                background: #67a37f;
+            }
+            #operationRow[state="failed"] #operationRail {
+                background: #d96d63;
             }
             #operationDot {
-                background: #3b82f6;
-                border-radius: 4px;
+                background: #7c9ecf;
+                border: 2px solid #eef4fb;
+                border-radius: 5px;
+            }
+            #operationRow[state="completed"] #operationDot {
+                background: #67a37f;
+                border: 2px solid #edf7f1;
+            }
+            #operationRow[state="failed"] #operationDot {
+                background: #d96d63;
+                border: 2px solid #fff1ef;
             }
             #operationTitle {
-                color: #364152;
-                font-size: 13px;
+                color: #202939;
+                font-size: 16px;
                 font-weight: 600;
+                line-height: 1.35;
+            }
+            #operationKind {
+                color: #7d8898;
+                font-size: 13px;
+                font-weight: 500;
             }
             #operationStatus {
-                color: #2d86eb;
-                font-size: 12px;
+                color: #445469;
+                background: #edf3fb;
+                border: 1px solid #d5e2f2;
+                border-radius: 999px;
+                padding: 0 12px;
+                font-size: 14px;
                 font-weight: 600;
-                min-width: 96px;
+                min-width: 104px;
+            }
+            #operationRow[state="running"] #operationStatus {
+                color: #35527f;
+                background: #edf3fb;
+                border: 1px solid #d5e2f2;
             }
             #operationRow[state="completed"] #operationStatus {
-                color: #1f8f5f;
+                color: #1f6a46;
+                background: #edf7f1;
+                border: 1px solid #cfe3d7;
             }
             #operationRow[state="failed"] #operationStatus {
-                color: #d04f4f;
+                color: #b42318;
+                background: #fff1ef;
+                border: 1px solid #f0d0cb;
             }
             QAbstractScrollArea {
                 background: transparent;
             }
             QScrollBar:vertical {
                 background: transparent;
-                width: 10px;
-                margin: 6px 2px 6px 2px;
+                width: 8px;
+                margin: 4px 2px 4px 2px;
             }
             QScrollBar::handle:vertical {
-                background: #c8d3e1;
-                min-height: 48px;
-                border-radius: 5px;
+                background: #cfcdc4;
+                min-height: 40px;
+                border-radius: 4px;
             }
             QScrollBar::handle:vertical:hover {
-                background: #aab8cb;
+                background: #a09c92;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
             QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical,
@@ -739,16 +1129,16 @@ class MainWindow(QMainWindow):
             }
             QScrollBar:horizontal {
                 background: transparent;
-                height: 10px;
-                margin: 2px 6px 2px 6px;
+                height: 8px;
+                margin: 2px 4px 2px 4px;
             }
             QScrollBar::handle:horizontal {
-                background: #c8d3e1;
-                min-width: 48px;
-                border-radius: 5px;
+                background: #cfcdc4;
+                min-width: 40px;
+                border-radius: 4px;
             }
             QScrollBar::handle:horizontal:hover {
-                background: #aab8cb;
+                background: #a09c92;
             }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
             QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal,
@@ -758,48 +1148,96 @@ class MainWindow(QMainWindow):
                 width: 0px;
             }
             #promptEdit {
-                background: white;
-                border: 1.5px solid #4ca2f6;
-                border-radius: 22px;
+                background: #ffffff;
+                border: 1px solid #cfcdc4;
+                border-radius: 8px;
                 padding: 0 16px;
-                color: #2f3540;
-                font-size: 15px;
-                selection-background-color: #d9ebff;
-                selection-color: #2f3540;
+                color: #26251e;
+                font-size: 16px;
+                font-weight: 400;
+                selection-background-color: #efeee8;
+                selection-color: #26251e;
+            }
+            #promptEdit:focus {
+                border: 1px solid #26251e;
             }
             #sendButton {
-                min-width: 90px;
-                min-height: 44px;
+                min-width: 88px;
+                min-height: 40px;
                 border: none;
-                border-radius: 22px;
-                background: #3396f4;
-                color: white;
-                font-size: 15px;
-                font-weight: 800;
+                border-radius: 8px;
+                background: #f54e00;
+                color: #ffffff;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            #sendButton:hover {
+                background: #d04200;
+            }
+            #sendButton:pressed {
+                background: #d04200;
+            }
+            #sendButton:disabled {
+                background: #e6e5e0;
+                color: #a09c92;
             }
             #minorButton {
-                min-width: 76px;
-                min-height: 44px;
-                border: 1px solid #dfe5ef;
-                border-radius: 22px;
-                background: white;
-                color: #5c6573;
+                min-width: 72px;
+                min-height: 40px;
+                border: 1px solid #cfcdc4;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #26251e;
                 font-size: 14px;
-                font-weight: 700;
+                font-weight: 500;
+            }
+            #minorButton:hover {
+                background: #fafaf7;
             }
             #warnButton {
-                min-width: 76px;
-                min-height: 44px;
-                border: 1px solid #f0d4d4;
-                border-radius: 22px;
-                background: #fff4f4;
-                color: #c44a4a;
+                min-width: 72px;
+                min-height: 40px;
+                border: 1px solid #cf2d56;
+                border-radius: 8px;
+                background: #ffffff;
+                color: #cf2d56;
                 font-size: 14px;
-                font-weight: 700;
+                font-weight: 500;
+            }
+            #warnButton:hover {
+                background: #fafaf7;
+            }
+            #expandDetailButton {
+                border: none;
+                background: transparent;
+                color: #26251e;
+                font-size: 14px;
+                font-weight: 500;
+                padding: 2px 0;
+                text-align: left;
+            }
+            #expandDetailButton:hover {
+                color: #f54e00;
+                text-decoration: underline;
+            }
+            QMenu {
+                background: #ffffff;
+                color: #26251e;
+                border: 1px solid #e6e5e0;
+                padding: 4px 0;
+            }
+            QMenu::item {
+                padding: 8px 28px 8px 16px;
+            }
+            QMenu::item:selected {
+                background: #fafaf7;
             }
             QStatusBar {
-                background: #f7f9fc;
-                color: #8d96a5;
+                background: #f7f7f4;
+                color: #807d72;
+                border-top: 1px solid #e6e5e0;
+                padding: 4px 12px;
+                font-size: 13px;
             }
             """
         )
@@ -852,14 +1290,16 @@ class MainWindow(QMainWindow):
         pinned: bool = False,
         state: Optional[dict] = None,
         activate: bool = True,
+        from_archive: bool = False,
     ) -> QPushButton:
         button = QPushButton(title)
         button.setProperty("conversation", True)
         button.setProperty("active", False)
         button.setProperty("pinned", bool(pinned))
-        button.setProperty("is_history", conversation_id.startswith("session::"))
         if not conversation_id:
             conversation_id = "conv_{}".format(int(time.time() * 1000))
+        is_history = bool(from_archive) or str(conversation_id).startswith("session::")
+        button.setProperty("is_history", is_history)
         button.setProperty("conversation_id", conversation_id)
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip(title)
@@ -975,6 +1415,7 @@ class MainWindow(QMainWindow):
         self._active_authorization_card = None
         self._pending_authorization = None
         self._seen_operation_states.clear()
+        self._chat_follow_tail = True
         self.prompt_edit.clear()
         self.prompt_edit.setFocus()
 
@@ -985,9 +1426,9 @@ class MainWindow(QMainWindow):
             self._insert_message(self._assistant_card, False)
         return self._assistant_card
 
-    def _insert_message(self, widget: QWidget, align_right: bool) -> None:
+    def _insert_message(self, widget: QWidget, align_right: bool, *, suppress_chat_scroll: bool = False) -> None:
         row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(0, 0, 4, 0)
         row.setSpacing(0)
         if align_right:
             row.addStretch(1)
@@ -999,10 +1440,11 @@ class MainWindow(QMainWindow):
         self.chat_layout.insertLayout(index, row)
         if widget not in self._message_widgets:
             self._message_widgets.append(widget)
-        self._update_message_widths()
-        self._scroll_bottom()
+        self._update_message_widths(scroll_if_following=not suppress_chat_scroll)
+        if not suppress_chat_scroll:
+            self._scroll_chat_to_bottom_force()
 
-    def _update_message_widths(self) -> None:
+    def _update_message_widths(self, *, scroll_if_following: bool = True) -> None:
         viewport = self.chat_scroll.viewport()
         if viewport is None:
             return
@@ -1014,10 +1456,46 @@ class MainWindow(QMainWindow):
                 widget.setFixedWidth(user_max)
             elif isinstance(widget, (AssistantCard, AuthorizationCard)):
                 widget.setFixedWidth(assistant_max)
+        if scroll_if_following:
+            self._scroll_chat_to_bottom_if_following()
 
-    def _scroll_bottom(self) -> None:
+    def _on_chat_scroll_value_changed(self, value: int) -> None:
+        if self._chat_scroll_programmatic:
+            return
         bar = self.chat_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        maximum = bar.maximum()
+        if maximum <= 0:
+            self._chat_follow_tail = True
+            return
+        margin = 72
+        self._chat_follow_tail = value >= maximum - margin
+
+    def _on_chat_scroll_range_changed(self, _minimum: int, maximum: int) -> None:
+        """内容高度变化后：若用户本就在底部，保持贴底（布局完成后再滚）。"""
+        if self._chat_scroll_programmatic or not self._chat_follow_tail:
+            return
+        if maximum <= 0:
+            return
+        QTimer.singleShot(0, self._scroll_chat_to_bottom_programmatic)
+
+    def _scroll_chat_to_bottom_programmatic(self) -> None:
+        bar = self.chat_scroll.verticalScrollBar()
+        self._chat_scroll_programmatic = True
+        try:
+            bar.setValue(bar.maximum())
+        finally:
+            self._chat_scroll_programmatic = False
+
+    def _scroll_chat_to_bottom_if_following(self) -> None:
+        if not self._chat_follow_tail:
+            return
+        QTimer.singleShot(0, self._scroll_chat_to_bottom_programmatic)
+
+    def _scroll_chat_to_bottom_force(self) -> None:
+        """新消息插入或用户发送后：重新锁定到底部并滚过去。"""
+        self._chat_follow_tail = True
+        QTimer.singleShot(0, self._scroll_chat_to_bottom_programmatic)
+
     def _run_task(self) -> None:
         prompt = self.prompt_edit.text().strip()
         if not prompt:
@@ -1041,6 +1519,7 @@ class MainWindow(QMainWindow):
         self._assistant_card.set_meta("")
         self._seen_operation_states.clear()
         self._insert_message(self._assistant_card, False)
+        self._worker_conversation_button = self._active_conversation_button
 
         if self._active_conversation_button is not None:
             text = prompt[:16] + ("..." if len(prompt) > 16 else "")
@@ -1081,7 +1560,7 @@ class MainWindow(QMainWindow):
                 )
                 if self._active_conversation_button is not None:
                     self._save_current_conversation_state(self._active_conversation_button)
-                self._scroll_bottom()
+                self._scroll_chat_to_bottom_if_following()
             return
 
         if re.search(r"^Executing\s+.+?\s+with args\s+.+", text):
@@ -1090,7 +1569,7 @@ class MainWindow(QMainWindow):
         if re.search(r"^Completed\s+.+?\s+->\s+.+", text):
             if self._active_conversation_button is not None:
                 self._save_current_conversation_state(self._active_conversation_button)
-            self._scroll_bottom()
+            self._scroll_chat_to_bottom_if_following()
             return
 
         if "Planning task" in text:
@@ -1105,7 +1584,7 @@ class MainWindow(QMainWindow):
             card.append_text(text, color)
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self._scroll_bottom()
+        self._scroll_chat_to_bottom_if_following()
 
     def _format_args(self, raw_args: str) -> str:
         try:
@@ -1133,7 +1612,7 @@ class MainWindow(QMainWindow):
             card.append_text(summary, "green")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self._scroll_bottom()
+        self._scroll_chat_to_bottom_if_following()
 
     def _update_operation(self, operation_id: str, kind: str, status: str, error: str) -> None:
         if self._assistant_card is None:
@@ -1154,12 +1633,14 @@ class MainWindow(QMainWindow):
             self._assistant_card.upsert_operation(display_operation_id, label, "failed")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
+        self._scroll_chat_to_bottom_if_following()
 
     def _operation_label(self, kind: str) -> str:
         mapping = {
             "command.run": "执行命令",
             "browser.open": "打开浏览器",
             "browser.search": "浏览器搜索",
+            "scholar.baidu_search": "百度学术检索",
             "filesystem.open_path": "打开文件",
             "filesystem.write_text": "写入文本文件",
             "spreadsheet.open": "打开表格",
@@ -1176,18 +1657,22 @@ class MainWindow(QMainWindow):
         localized = self._localize_runtime_text(message)
         verification_markers = [
             "检测到搜索验证",
+            "检测到百度安全验证",
             "请在浏览器中手动完成验证",
             "验证已通过，正在继续执行搜索任务",
+            "百度安全验证已通过，正在继续执行搜索任务",
         ]
         if any(marker in localized for marker in verification_markers):
             card = self._ensure_assistant_card()
             card.append_text(localized, "yellow")
             if self._active_conversation_button is not None:
                 self._save_current_conversation_state(self._active_conversation_button)
-            self._scroll_bottom()
+            self._scroll_chat_to_bottom_if_following()
         self._set_status_message(message, timed=self._running)
 
     def _ask_clarification(self, question: str) -> None:
+        if self._worker_conversation_button is not None and self._active_conversation_button is not self._worker_conversation_button:
+            self._activate_conversation(self._worker_conversation_button)
         self._awaiting_clarification = True
         self._pending_input_mode = "clarification"
         self.prompt_edit.setEnabled(True)
@@ -1199,8 +1684,11 @@ class MainWindow(QMainWindow):
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
         self._set_status_message("\u8bf7\u5728\u4e0b\u65b9\u8f93\u5165\u8865\u5145\u4fe1\u606f\u540e\u53d1\u9001")
+        self._scroll_chat_to_bottom_if_following()
 
     def _clarification_consumed(self) -> None:
+        if self._worker_conversation_button is not None and self._active_conversation_button is not self._worker_conversation_button:
+            self._activate_conversation(self._worker_conversation_button)
         self._assistant_card = AssistantCard()
         self._assistant_card.set_meta("")
         self._seen_operation_states.clear()
@@ -1209,28 +1697,37 @@ class MainWindow(QMainWindow):
         self._set_status_message("\u5df2\u6536\u5230\u4f60\u7684\u8865\u5145\u4fe1\u606f\uff0c\u6b63\u5728\u7ee7\u7eed\u89c4\u5212")
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self._scroll_bottom()
+        self._scroll_chat_to_bottom_if_following()
 
     def _ask_authorization(self, action_type: str, details: str) -> None:
+        if self._worker_conversation_button is not None and self._active_conversation_button is not self._worker_conversation_button:
+            self._activate_conversation(self._worker_conversation_button)
         self._awaiting_authorization = True
         self._pending_authorization = {"action_type": action_type, "details": details}
         self.prompt_edit.setEnabled(False)
+        self.run_button.setEnabled(False)
         card = self._ensure_assistant_card()
         card.append_text("\u8fd9\u4e00\u6b65\u6709\u98ce\u9669\uff0c\u9700\u8981\u4f60\u786e\u8ba4\u540e\u6211\u518d\u7ee7\u7eed\u3002", "yellow")
+        card.record_authorization_pending(action_type, details)
 
         def decide(allowed: bool) -> None:
+            auth_card = self._active_authorization_card
+            if auth_card is not None:
+                auth_card.apply_resolved(allowed)
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
             self._awaiting_authorization = False
             self._pending_input_mode = ""
             self._pending_authorization = None
             self.prompt_edit.setEnabled(True)
             self.run_button.setEnabled(True)
-            if self._active_authorization_card is not None:
-                self._active_authorization_card.setEnabled(False)
             self._worker.submit_authorization(allowed)
             if self._assistant_card is not None:
                 self._assistant_card.append_text("\u5df2\u5141\u8bb8\u7ee7\u7eed\u3002" if allowed else "\u5df2\u62d2\u7edd\u8fd9\u4e00\u6b65\u3002", "yellow")
             if self._active_conversation_button is not None:
                 self._save_current_conversation_state(self._active_conversation_button)
+            self._scroll_chat_to_bottom_if_following()
 
         self._mount_authorization_card(card, action_type, details, decide)
         self._set_status_message("\u8bf7\u786e\u8ba4\u662f\u5426\u5141\u8bb8\u6267\u884c\u8be5\u6b65\u9aa4")
@@ -1241,7 +1738,7 @@ class MainWindow(QMainWindow):
         card.add_inline_widget(auth_widget)
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
-        self._scroll_bottom()
+        self._scroll_chat_to_bottom_if_following()
 
     def _localize_runtime_text(self, text: str) -> str:
         value = str(text or "")
@@ -1294,30 +1791,41 @@ class MainWindow(QMainWindow):
     def _restore_authorization_card(self, action_type: str, details: str) -> None:
         if self._assistant_card is None or self._active_authorization_card is not None:
             return
+        self.prompt_edit.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self._set_status_message("\u8bf7\u786e\u8ba4\u662f\u5426\u5141\u8bb8\u6267\u884c\u8be5\u6b65\u9aa4")
 
         def decide(allowed: bool) -> None:
+            auth_card = self._active_authorization_card
+            if auth_card is not None:
+                auth_card.apply_resolved(allowed)
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
             self._awaiting_authorization = False
             self._pending_input_mode = ""
             self._pending_authorization = None
             self.prompt_edit.setEnabled(True)
             self.run_button.setEnabled(True)
-            if self._active_authorization_card is not None:
-                self._active_authorization_card.setEnabled(False)
             self._worker.submit_authorization(allowed)
             if self._assistant_card is not None:
                 self._assistant_card.append_text("\u5df2\u5141\u8bb8\u7ee7\u7eed\u3002" if allowed else "\u5df2\u62d2\u7edd\u8fd9\u4e00\u6b65\u3002", "yellow")
             if self._active_conversation_button is not None:
                 self._save_current_conversation_state(self._active_conversation_button)
+            self._scroll_chat_to_bottom_if_following()
 
         self._mount_authorization_card(self._assistant_card, action_type, details, decide)
 
     def _task_finished(self, payload: dict) -> None:
+        if self._worker_conversation_button is not None and self._active_conversation_button is not self._worker_conversation_button:
+            self._activate_conversation(self._worker_conversation_button)
         self._awaiting_clarification = False
         self._awaiting_authorization = False
         self._pending_input_mode = ""
         self._clarification_resume_active = False
         self._active_authorization_card = None
         self._pending_authorization = None
+        self._worker_conversation_button = None
         if self._active_conversation_button is not None:
             conversation_state = dict(self._conversation_data.get(self._active_conversation_button, {}) or {})
             conversation_state["session_memory_dir"] = str(payload.get("session_memory_dir", "") or "")
@@ -1336,15 +1844,19 @@ class MainWindow(QMainWindow):
         if self._active_conversation_button is not None:
             self._save_current_conversation_state(self._active_conversation_button)
             self._persist_conversation_history()
+        self._scroll_chat_to_bottom_if_following()
 
     def _task_failed(self, error: str) -> None:
         error = self._localize_runtime_text(error)
+        if self._worker_conversation_button is not None and self._active_conversation_button is not self._worker_conversation_button:
+            self._activate_conversation(self._worker_conversation_button)
         self._awaiting_clarification = False
         self._awaiting_authorization = False
         self._pending_input_mode = ""
         self._clarification_resume_active = False
         self._active_authorization_card = None
         self._pending_authorization = None
+        self._worker_conversation_button = None
         if self._assistant_card is not None:
             message = "\u4efb\u52a1\u5df2\u53d6\u6d88\u3002" if "\u53d6\u6d88" in str(error) else f"\u4efb\u52a1\u5931\u8d25\uff1a{error}"
             self._assistant_card.append_text(message, "red" if "\u53d6\u6d88" not in str(error) else "yellow")
@@ -1353,6 +1865,7 @@ class MainWindow(QMainWindow):
             self._save_current_conversation_state(self._active_conversation_button)
             self._persist_conversation_history()
         self._set_status_message("\u4efb\u52a1\u5df2\u53d6\u6d88" if "\u53d6\u6d88" in str(error) else "\u4efb\u52a1\u5931\u8d25")
+        self._scroll_chat_to_bottom_if_following()
 
     def _save_current_conversation_state(self, button: QPushButton) -> None:
         messages = []
@@ -1403,7 +1916,7 @@ class MainWindow(QMainWindow):
         for message in messages:
             if message.get("type") == "user":
                 box = UserBubble(message.get("body", ""))
-                self._insert_message(box, True)
+                self._insert_message(box, True, suppress_chat_scroll=True)
             elif message.get("type") == "assistant":
                 card = AssistantCard()
                 stream = list(message.get("stream", []) or [])
@@ -1414,13 +1927,25 @@ class MainWindow(QMainWindow):
                     card.restore_operations(list(message.get("operations", [])))
                 card.set_meta("")
                 self._assistant_card = card
-                self._insert_message(card, False)
+                self._insert_message(card, False, suppress_chat_scroll=True)
+        if self._assistant_card is not None and self._awaiting_authorization and not self._pending_authorization:
+            recovered = self._assistant_card.pending_authorization_from_stream()
+            if recovered:
+                self._pending_authorization = recovered
         if self._awaiting_authorization and self._pending_authorization and self._assistant_card is not None:
             self._restore_authorization_card(
                 self._pending_authorization.get("action_type", ""),
                 self._pending_authorization.get("details", ""),
             )
+        elif self._awaiting_clarification:
+            self.prompt_edit.setEnabled(True)
+            self.run_button.setEnabled(True)
+            self._set_status_message("\u8bf7\u5728\u4e0b\u65b9\u8f93\u5165\u8865\u5145\u4fe1\u606f\u540e\u53d1\u9001")
+        else:
+            self.prompt_edit.setEnabled(True)
+            self.run_button.setEnabled(not self._running)
         self.prompt_edit.setFocus()
+        self._scroll_chat_to_bottom_force()
 
     def _load_conversation_history(self) -> None:
         archive = self._read_conversation_archive()
@@ -1441,6 +1966,7 @@ class MainWindow(QMainWindow):
                 pinned=bool(entry.get("pinned", False)),
                 state=state,
                 activate=False,
+                from_archive=True,
             )
 
         self._reorder_conversations()
@@ -1515,7 +2041,7 @@ class MainWindow(QMainWindow):
             "magenta": "#7b58d0",
         }
         safe = html.escape(str(text or "").strip())
-        return '<div style="color:{}; margin-bottom:6px; background:transparent;">{}</div>'.format(
+        return '<div style="color:{}; margin-bottom:2px; background:transparent; line-height:1.45;">{}</div>'.format(
             palette.get(color, "#364152"),
             safe,
         )
@@ -1556,6 +2082,8 @@ class MainWindow(QMainWindow):
             return "打开浏览器并进入 {}".format(args.get("url", ""))
         if kind == "browser.search":
             return "在浏览器中搜索 {}".format(args.get("text", ""))
+        if kind == "scholar.baidu_search":
+            return "在百度学术检索 {}".format(args.get("text", ""))
         if kind == "command.run":
             return "执行命令 {}".format(args.get("command", ""))
         return str(operation.get("description", kind) or kind)

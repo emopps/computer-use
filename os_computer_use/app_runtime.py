@@ -10,6 +10,11 @@ from os_computer_use.logging import logger
 load_dotenv()
 
 
+def visual_fallback_enabled() -> bool:
+    value = str(os.getenv("OCU_ENABLE_VISUAL_FALLBACK", "0") or "0").strip().lower()
+    return value not in {"0", "false", "no", "off", "disable", "disabled"}
+
+
 def ensure_supported_python() -> None:
     if sys.version_info < (3, 8):
         version = ".".join(str(part) for part in sys.version_info[:3])
@@ -49,7 +54,9 @@ async def build_agent(output_dir, memory_dir, session_memory_dir):
     from os_computer_use.llm.config import action_model, vision_model
 
     desktop = LocalDesktop()
-    await prepare_visual_fallback(vision_model)
+    enabled = visual_fallback_enabled()
+    effective_vision_model = vision_model if enabled else None
+    await prepare_visual_fallback(effective_vision_model)
     return {
         "intent": IntentAgent(action_model),
         "planner": PlannerAgent(action_model),
@@ -58,7 +65,8 @@ async def build_agent(output_dir, memory_dir, session_memory_dir):
             desktop,
             FileTool(),
             reasoning_model=action_model,
-            vision_model=vision_model,
+            vision_model=effective_vision_model,
+            artifact_dir=output_dir,
         ),
         "memory": MemoryAgent(memory_root=memory_dir, session_dir=session_memory_dir),
         "audit": AuditAgent(os.path.join(output_dir, "audit.log")),
@@ -69,10 +77,11 @@ async def warmup_runtime():
     from os_computer_use.llm.config import action_model, vision_model
 
     _ = action_model
-    await prepare_visual_fallback(vision_model)
+    effective_vision_model = vision_model if visual_fallback_enabled() else None
+    await prepare_visual_fallback(effective_vision_model)
     return {
         "reasoning_ready": True,
-        "vision_ready": vision_model is not None,
+        "vision_ready": effective_vision_model is not None,
     }
 
 
